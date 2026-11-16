@@ -1,0 +1,21 @@
+name: cbgram
+
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install cbcrypto (Rust core, built from source) and cbgram
+        run: |
+          pip install git+https://github.com/abhiadi23/cbcrypto
+          pip install . pytest pytest-asyncio
+
+      - name: Run tests
+        run: python -m pytest -q -p no:cacheprovider tests/test_core_engine.py tests/test_core_transfer.py tests/test_crypto_backend.py

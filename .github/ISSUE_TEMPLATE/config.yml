@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Read the documentation
+    url: https://cbgram.example
+    about: Guides, the full API reference and the Pyrogram migration notes live here.
+  - name: Ask cbgram related questions
+    url: https://t.me/YOUR_CBGRAM_CHAT
+    about: This place is only for reporting issues about cbgram. Questions and discussion go to the Telegram group.
+  - name: Join the Telegram channel
+    url: https://t.me/YOUR_CBGRAM_CHANNEL
+    about: Follow the channel for news, releases and announcements.
