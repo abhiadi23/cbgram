@@ -1,7 +1,4 @@
 <div align="center">
-
-<img src="https://raw.githubusercontent.com/abhiadi23/cbgram/main/assets/png/cbgram-icon-256.png" alt="cbgram" width="160">
-
 # cbgram
 
 [![PyPI](https://img.shields.io/pypi/v/cbgram)](https://pypi.org/project/cbgram/)
