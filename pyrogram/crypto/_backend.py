@@ -47,3 +47,5 @@ _self_test()
 # inside cbcrypto itself: it registers its own os.register_at_fork hook when it is imported.
 
 log.info("Crypto backend: cbcrypto (%s)", impl.backend())
+if not hasattr(impl, "tl_parse"):
+    log.info("cbcrypto < 0.4: TL parsing stays on the Python classes (upgrade for the native codec)")
