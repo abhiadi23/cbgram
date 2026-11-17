@@ -23,6 +23,7 @@ import pyrogram
 from pyrogram import raw
 from pyrogram.raw.core import TLObject
 from pyrogram.methods.rate_limiter import RateLimiter
+from pyrogram.flood import FloodController, bind_ticket, unbind_ticket
 
 log = logging.getLogger(__name__)
 
@@ -293,14 +294,34 @@ class Invoke:
             category = self._classify_query(query)
             await self.rate_limiter.acquire(category)
 
-        r = await self.session.invoke(
-            query,
-            retries if retries is not None else self.retries,
-            timeout if timeout is not None else self.timeout,
-            (sleep_threshold
-             if sleep_threshold is not None
-             else self.sleep_threshold)
-        )
+        effective_threshold = sleep_threshold if sleep_threshold is not None else self.sleep_threshold
+
+        ticket = None
+        token = None
+        flood = getattr(self, "flood", None)
+
+        if isinstance(flood, FloodController) and flood.enabled:
+            inner = self._unwrap(query)
+            ticket = await flood.acquire(inner, self._classify_query(query), effective_threshold)
+            token = bind_ticket(ticket)
+
+        try:
+            r = await self.session.invoke(
+                query,
+                retries if retries is not None else self.retries,
+                timeout if timeout is not None else self.timeout,
+                effective_threshold
+            )
+        except BaseException as e:
+            if ticket is not None:
+                ticket.fail(e)
+            raise
+        else:
+            if ticket is not None:
+                ticket.ok()
+        finally:
+            if token is not None:
+                unbind_ticket(token)
 
         try:
             await self.fetch_peers(getattr(r, "users", []))
