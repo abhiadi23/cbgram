@@ -43,6 +43,19 @@ def gcd(a: int, b: int) -> int:
 
 
 def decompose(pq: int) -> int:
+    # Rust Pollard-Brent (GIL released): ~microseconds instead of tens of ms
+    if pq < 1 << 64:
+        try:
+            from pyrogram.crypto._backend import impl
+
+            return impl.factorize_pq(pq)[0]
+        except (ImportError, AttributeError, ValueError):
+            pass
+
+    return _decompose_py(pq)
+
+
+def _decompose_py(pq: int) -> int:
     # https://comeoncodeon.wordpress.com/2010/09/18/pollard-rho-brent-integer-factorization/
     if pq % 2 == 0:
         return 2
