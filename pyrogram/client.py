@@ -60,6 +60,7 @@ from pyrogram.errors import (
 from pyrogram.handlers.handler import Handler
 from pyrogram.methods import Methods
 from pyrogram.methods.rate_limiter import AdaptiveBucket, TokenBucket
+from pyrogram.flood import FloodController
 from pyrogram.qrlogin import QRLogin
 from pyrogram.session import Auth, Session
 from pyrogram.storage import SQLiteStorage, Storage
@@ -467,6 +468,15 @@ class Client(Methods):
             default**; leave this ``None`` to match upstream Pyrogram behaviour and send without client-side
             throttling, letting Telegram's server-side FloodWait handling (see *sleep_threshold*) manage the pace.
 
+        flood_control (``bool`` | ``dict`` | :obj:`~pyrogram.flood.FloodController`, *optional*):
+            Adaptive FloodWait controller (see ``pyrogram/flood.py``). Concurrent callers share one cooldown per
+            method instead of each sleeping and retrying, calls arriving during a penalty never reach the network,
+            the rate that triggered a flood is learned and respected afterwards, sends are paced per chat
+            (~1/s) and overall (~30/s), and in-flight requests per kind start at 8 and adapt (AIMD).
+            Enabled by default; pass False (or set ``CBGRAM_FLOOD=0``) to disable, or a dict of options, e.g.
+            ``{"per_peer_rate": 0.5, "concurrency": 16}``. ``None`` for per-chat pacing: ``{"per_peer_rate": None}``.
+            Counters are available from ``client.flood.stats()``.
+
         auto_no_updates (``bool``, *optional*):
             Pass True to automatically wrap read-only and non-critical API calls with InvokeWithoutUpdates,
             reducing server-side update traffic and flood pressure.
@@ -572,7 +582,8 @@ class Client(Methods):
         protocol_factory: Type[TCP] = TCPAbridged,
         loop: Optional[asyncio.AbstractEventLoop] = None,
         rate_limits: Optional[dict] = None,
-        auto_no_updates: Optional[bool] = True
+        auto_no_updates: Optional[bool] = True,
+        flood_control: Union[bool, dict, FloodController, None] = None
     ):
         super().__init__()
 
@@ -625,6 +636,7 @@ class Client(Methods):
 
         from pyrogram.methods.rate_limiter import RateLimiter
         self.rate_limiter = RateLimiter(rate_limits) if rate_limits is not None else None
+        self.flood = FloodController.from_config(flood_control)
         self.auto_no_updates = auto_no_updates
 
         self.executor = get_handler_executor()
