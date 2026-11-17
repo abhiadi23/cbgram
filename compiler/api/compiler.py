@@ -84,6 +84,53 @@ class Combinator(NamedTuple):
     type: str
 
 
+def build_native_spec(c: Combinator) -> str:
+    """One line of the native TL schema table consumed by cbcrypto's Rust codec.
+
+    Mirrors the read/write logic the Python templates are generated from, so
+    the native codec and the generated classes can never disagree about layout.
+
+    line := <id hex> | <qualified class path> | <field> ; <field> ...
+    field := <name> , <code> , <flags slot or -> , <bit or ->
+    code  := # (flags word) | i q I J d b s B (core) | t (flag-only true)
+             | O (object) | W (vector of objects) | V<core> (vector of core)
+    """
+    core_codes = {"int": "i", "long": "q", "int128": "I", "int256": "J",
+                  "double": "d", "bytes": "b", "string": "s", "Bool": "B"}
+    flag_slots = {}
+    fields = []
+
+    for arg_name, arg_type in c.args:
+        if re.match(r"flags\d?", arg_name) and arg_type == "#":
+            flag_slots[arg_name[len("flags"):]] = len(flag_slots)
+            fields.append(f"{arg_name},#,{flag_slots[arg_name[len('flags'):]]},-")
+            continue
+
+        flag = FLAGS_RE_2.match(arg_type)
+
+        if flag:
+            number, index, flag_type = flag.groups()
+            slot, bit = flag_slots[number], index
+            inner = flag_type
+        else:
+            slot, bit = "-", "-"
+            inner = arg_type
+
+        if inner == "true":
+            code = "t"
+        elif inner in core_codes:
+            code = core_codes[inner]
+        elif "vector" in inner.lower():
+            sub_type = inner.split("<")[1][:-1]
+            code = "V" + core_codes[sub_type] if sub_type in CORE_TYPES and sub_type != "true" else "W"
+        else:
+            code = "O"
+
+        fields.append(f"{arg_name},{code},{slot},{bit}")
+
+    return f"{c.id[2:].lower()}|pyrogram.raw.{c.section}.{c.qualname}|" + ";".join(fields)
+
+
 def snake(s: str):
     # https://stackoverflow.com/q/1175208
     s = re.sub(r"(.)([A-Z][a-z]+)", r"\1_\2", s)
@@ -711,6 +758,16 @@ def start(format: bool = False):
         f.write('\n    0x5bb8e511: "pyrogram.raw.core.Message",')
 
         f.write("\n}\n")
+
+    # Native schema table for cbcrypto's Rust TL codec (see build_native_spec).
+    with open(DESTINATION_PATH / "tl_spec.py", "w", encoding="utf-8") as f:
+        f.write(notice + "\n\n")
+        f.write(WARNING + "\n\n")
+        f.write(f"layer = {layer}\n\n")
+        f.write('SPEC = """\\\n')
+        for c in combinators:
+            f.write(build_native_spec(c) + "\n")
+        f.write('"""\n')
 
 
 if "__main__" == __name__:
