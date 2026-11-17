@@ -35,15 +35,20 @@ from pyrogram import raw
 from pyrogram.connection import Connection, transport_error
 from pyrogram.connection.proxy import client_proxy_address
 from pyrogram.crypto.executor import get_crypto_executor
+from pyrogram.flood import FloodController
 from pyrogram.errors import (
     RPCError, InternalServerError, AuthKeyDuplicated, FloodWait, FloodPremiumWait, ServiceUnavailable,
     BadMsgNotification, SecurityCheckMismatch
 )
 from pyrogram.raw.all import layer
-from pyrogram.raw.core import TLObject, Message, MsgContainer, Int, FutureSalts
+from pyrogram.raw.core import TLObject, Message, MsgContainer, Int, FutureSalts, tl_native
 from .internals import MsgId, MsgFactory
 
 log = logging.getLogger(__name__)
+
+# native (Rust) TL codec for the per-packet hot path; silently stays on the
+# generated Python classes if cbcrypto is too old or CBGRAM_NATIVE_TL=0
+tl_native.init()
 
 
 def _serialize_file_part(data: TLObject) -> Optional[bytes]:
@@ -448,7 +453,7 @@ class Session:
             await self._teardown(str(e))
             return
 
-        body = TLObject.read(BytesIO(body_bytes))
+        body = tl_native.parse(body_bytes)
         message = Message(body, msg_id, seq_no, length)
 
         messages = (
@@ -709,7 +714,7 @@ class Session:
 
         serialized = _serialize_file_part(data)
         if serialized is None:
-            serialized = data.write()
+            serialized = tl_native.write(data)
 
         message = self.msg_factory(data, len(serialized))
         msg_id = message.msg_id
@@ -862,7 +867,14 @@ class Session:
                 log.warning('[%s] Waiting for %s seconds before continuing (required by "%s")',
                             self.client.name, amount, query_name)
 
-                await asyncio.sleep(amount)
+                flood = getattr(self.client, "flood", None)
+
+                if isinstance(flood, FloodController) and flood.enabled:
+                    # one shared deadline for every concurrent caller of this
+                    # method, instead of each sleeping and retrying on its own
+                    await flood.flood(query_name, amount)
+                else:
+                    await asyncio.sleep(amount)
             except (OSError, InternalServerError, ServiceUnavailable, TimeoutError) as e:
                 retries -= 1
                 if retries == 0:
