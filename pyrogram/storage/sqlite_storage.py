@@ -20,6 +20,7 @@ import aiosqlite
 import asyncio
 import logging
 import os
+import sqlite3
 import time
 from pathlib import Path
 from typing import Any, List, Optional, Tuple
@@ -173,6 +174,7 @@ class SQLiteStorage(Storage):
         self._write_count: int = 0
         self._flush_task: Optional[asyncio.Task] = None
         self._lock_fd: Optional[object] = None
+        self._write_lock = asyncio.Lock()
 
         if self.in_memory:
             self.database = ":memory:"
@@ -395,12 +397,23 @@ class SQLiteStorage(Storage):
     async def update_usernames(self, usernames: List[Tuple[int, List[str]]]):
         if not usernames or self.conn is None:
             return
-        await self.conn.executemany("DELETE FROM usernames WHERE id = ?", [(id,) for id, _ in usernames])
 
-        await self.conn.executemany(
-            "REPLACE INTO usernames (id, username) VALUES (?, ?)",
-            [(id, username) for id, usernames in usernames for username in usernames],
-        )
+        rows = [(id, username) for id, names in usernames for username in names]
+
+        # One writer at a time: concurrent update batches (many bots, big update bursts) used to
+        # interleave their executemany() calls on the single connection and raise
+        # "sqlite3.InterfaceError: bad parameter or other API misuse", which aborted the update.
+        async with self._write_lock:
+            try:
+                await self.conn.executemany("DELETE FROM usernames WHERE id = ?", [(id,) for id, _ in usernames])
+
+                if rows:
+                    await self.conn.executemany("REPLACE INTO usernames (id, username) VALUES (?, ?)", rows)
+            except sqlite3.InterfaceError as e:
+                # a username cache write is not worth losing the update that carried it
+                log.warning("Could not update the username cache (%s); will retry with the next update", e)
+                return
+
         await self._maybe_commit()
 
     async def update_state(self, value: Tuple[int, int, int, int, int] = object):
