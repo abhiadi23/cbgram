@@ -31,26 +31,16 @@ __contributors__ = [
 ]
 
 
-# Faster event loop: uvloop is used whenever it is installed (Linux/macOS, CPython), because the
-# whole client - every session read, ping and handler - runs on one loop and uvloop's is
-# roughly twice as fast as asyncio's default one. Set CBGRAM_UVLOOP=0 to keep the default loop.
-# Falls back silently to asyncio's default loop if uvloop is missing or unsupported (Termux).
+# Opt-in faster event loop: set CBGRAM_UVLOOP=1 (needs `pip install uvloop`; Linux/macOS).
+# Falls back silently to asyncio's default loop if uvloop is not available.
 import os as _os
 
-if _os.environ.get("CBGRAM_UVLOOP", "1").strip().lower() not in ("0", "false", "no", "off"):
+if _os.environ.get("CBGRAM_UVLOOP", "").strip().lower() in ("1", "true", "yes", "on"):
     try:
         import asyncio as _asyncio
-        import sys as _sys
-        import warnings as _warnings
+        import uvloop as _uvloop
 
-        if _sys.platform != "win32":
-            import uvloop as _uvloop
-
-            # leave a policy the application already chose alone
-            if type(_asyncio.get_event_loop_policy()).__module__.startswith("asyncio"):
-                with _warnings.catch_warnings():
-                    _warnings.simplefilter("ignore", DeprecationWarning)
-                    _asyncio.set_event_loop_policy(_uvloop.EventLoopPolicy())
+        _asyncio.set_event_loop_policy(_uvloop.EventLoopPolicy())
     except Exception:  # not installed / unsupported platform (e.g. Termux)
         pass
 
