@@ -17,6 +17,7 @@ import logging
 import math
 import os
 import threading
+import time
 from typing import Callable, Optional, Union
 
 import cbcrypto
@@ -33,6 +34,64 @@ log = logging.getLogger(__name__)
 CHUNK_SIZE = 1024 * 1024
 PART_SIZE = 512 * 1024
 UPLOAD_POOL_MAX = 20
+
+# Socket receive buffer. 0 would leave the OS default, which on Android/Termux and some
+# containers is small enough to cap a single 1 MiB-chunk connection well below 30 MB/s.
+DEFAULT_SOCKET_BUFFER = 4 * 1024 * 1024
+
+
+def _download_window(file_size: int, is_bot: bool, is_premium: bool):
+    """(connections, requests in flight per connection) for a download.
+
+    Throughput is (bytes in flight) / (latency of one request). The old fixed 5 x 3 = 15 MiB
+    window was enough while Telegram answered in ~0.3 s, but latency climbs on big, cold files
+    and the same window then delivers only 15-18 MB/s. Big files therefore get a bigger window;
+    the pacer (not the window) is what keeps the request rate under the flood limit.
+    """
+    chunks = max(1, math.ceil(file_size / CHUNK_SIZE))
+    mib = file_size / (1024 * 1024)
+
+    if is_premium and not is_bot:
+        pool, workers = 8, 4
+    elif mib < 8:
+        pool, workers = 3, 3
+    elif mib < 64:
+        pool, workers = 5, 4
+    elif mib < 512:
+        pool, workers = 6, 4
+    else:
+        pool, workers = 8, 4
+
+    return max(1, min(pool, chunks)), max(1, workers)
+
+
+_noted: set = set()
+
+
+def _note_fallback(reason: str) -> None:
+    """Say once, at INFO, why the slower pure-Python path is used instead of the Rust core."""
+    if reason not in _noted:
+        _noted.add(reason)
+        log.info("Rust transfer core not used (%s): falling back to the pure-Python path", reason)
+
+
+def _fallback_reason(client) -> Optional[str]:
+    if os.environ.get("CBGRAM_RUST_CORE", "1") == "0":
+        return "CBGRAM_RUST_CORE=0"
+    if client.proxy:
+        return "a proxy is configured on this client"
+    return None
+
+
+def _clock_offset() -> float:
+    """Seconds to add to the wall clock to get server time, as the session layer sees it.
+
+    The session layer keeps time as wall-clock-at-start + monotonic, so a later step of the
+    system clock cannot move it. The Rust core is handed this value once and from then on
+    also runs on a monotonic clock (see cbcrypto's Clock), so both sides agree and neither
+    can be thrown off by an NTP step or a VM pause.
+    """
+    return float(MsgId.now() - time.time())
 
 
 def enabled(client) -> bool:
@@ -163,7 +222,7 @@ async def _init_prefix(client) -> bytes:
 
 
 def _socket_buffer() -> int:
-    return int(os.environ.get("CBGRAM_SOCKET_BUFFER", 0))
+    return int(os.environ.get("CBGRAM_SOCKET_BUFFER", DEFAULT_SOCKET_BUFFER))
 
 
 async def _endpoint(client, dc_id: int):
@@ -188,7 +247,11 @@ async def download(client, file_id, file_size: int, file, progress, progress_arg
     """Download ``file_id`` into the open (pre-sized) local file. False = not handled, use Python."""
     path = getattr(file, "name", None)
 
-    if not enabled(client) or file_size <= 0 or not isinstance(path, str):
+    if not enabled(client):
+        _note_fallback(_fallback_reason(client) or "disabled")
+        return False
+
+    if file_size <= 0 or not isinstance(path, str):
         return False
 
     async with client.get_file_semaphore:
@@ -197,14 +260,16 @@ async def download(client, file_id, file_size: int, file, progress, progress_arg
         is_bot, is_premium = _flags(client)
         env = os.environ.get
 
+        auto_pool, auto_workers = _download_window(file_size, is_bot, is_premium)
+
         if is_bot:
-            pool, workers = int(env("CBGRAM_DL_POOL_BOT", 5)), int(env("CBGRAM_DL_WORKERS_BOT", 3))
+            pool, workers = int(env("CBGRAM_DL_POOL_BOT", auto_pool)), int(env("CBGRAM_DL_WORKERS_BOT", auto_workers))
             rate, burst = int(env("CBGRAM_DL_RATE_BOT", 16)), int(env("CBGRAM_DL_BURST_BOT", 8))
         elif is_premium:
-            pool, workers = int(env("CBGRAM_DL_POOL_PREMIUM", 6)), int(env("CBGRAM_DL_WORKERS_PREMIUM", 4))
+            pool, workers = int(env("CBGRAM_DL_POOL_PREMIUM", auto_pool)), int(env("CBGRAM_DL_WORKERS_PREMIUM", auto_workers))
             rate, burst = int(env("CBGRAM_DL_RATE_PREMIUM", 150)), int(env("CBGRAM_DL_BURST_PREMIUM", 35))
         else:
-            pool, workers = int(env("CBGRAM_DL_POOL_USER", 5)), int(env("CBGRAM_DL_WORKERS_USER", 3))
+            pool, workers = int(env("CBGRAM_DL_POOL_USER", auto_pool)), int(env("CBGRAM_DL_WORKERS_USER", auto_workers))
             rate, burst = int(env("CBGRAM_DL_RATE_USER", 8)), int(env("CBGRAM_DL_BURST_USER", 8))
 
         session, host, port = await _endpoint(client, dc_id)
@@ -231,9 +296,12 @@ async def download(client, file_id, file_size: int, file, progress, progress_arg
             ceiling=float(max(rate, 150)),
             growth=float(env("CBGRAM_DL_GROWTH", 1.5)) if _slow_start() else 1.0,
             slow_start_cap=float(env("CBGRAM_DL_SLOWSTART_CAP", 40)),
-            time_offset=float(MsgId.time_offset),
+            time_offset=_clock_offset(),
             recv_buffer=_socket_buffer(),
             read_timeout=float(Session.MEDIA_WAIT_TIMEOUT),
+            flood_each_cap=float(env("CBGRAM_FLOOD_EACH_CAP", 120)),
+            flood_total_cap=float(env("CBGRAM_FLOOD_TOTAL_CAP", 900)),
+            max_reconnects=int(env("CBGRAM_MAX_RECONNECTS", 8)),
         )
 
         try:
@@ -246,7 +314,11 @@ async def download(client, file_id, file_size: int, file, progress, progress_arg
 
 async def upload(client, path, progress, progress_args):
     """Upload a local file by path. Returns InputFile/InputFileBig, or NotImplemented = use Python."""
-    if not enabled(client) or not isinstance(path, (str, os.PathLike)):
+    if not enabled(client):
+        _note_fallback(_fallback_reason(client) or "disabled")
+        return NotImplemented
+
+    if not isinstance(path, (str, os.PathLike)):
         return NotImplemented
 
     path = os.fspath(path)
@@ -272,7 +344,7 @@ async def upload(client, path, progress, progress_args):
 
     if is_bot:
         rate = int(env("CBGRAM_UPLOAD_RATE_BOT", 32))
-        pool = min(int(env("CBGRAM_UPLOAD_POOL_BOT", 8)), UPLOAD_POOL_MAX, pool_cap)
+        pool = min(int(env("CBGRAM_UPLOAD_POOL_BOT", 10)), UPLOAD_POOL_MAX, pool_cap)
     elif is_premium:
         rate = int(env("CBGRAM_UPLOAD_RATE_PREMIUM", 300))
         pool = min(int(env("CBGRAM_UPLOAD_POOL_PREMIUM", 14)), UPLOAD_POOL_MAX, pool_cap)
@@ -306,7 +378,7 @@ async def upload(client, path, progress, progress_args):
         part_size=PART_SIZE,
         is_big=is_big,
         connections=max(1, pool),
-        inflight=2,
+        inflight=int(env("CBGRAM_UPLOAD_INFLIGHT", 4)),
         paced=is_bot or not is_premium,
         rate=float(rate),
         burst=16.0,
@@ -314,9 +386,12 @@ async def upload(client, path, progress, progress_args):
         step=1.0,
         growth=float(env("CBGRAM_UPLOAD_GROWTH", 1.5)) if _slow_start() else 1.0,
         slow_start_cap=float(env("CBGRAM_UPLOAD_SLOWSTART_CAP", 80)),
-        time_offset=float(MsgId.time_offset),
+        time_offset=_clock_offset(),
         recv_buffer=_socket_buffer(),
         read_timeout=float(Session.MEDIA_WAIT_TIMEOUT),
+        flood_each_cap=float(env("CBGRAM_FLOOD_EACH_CAP", 120)),
+        flood_total_cap=float(env("CBGRAM_FLOOD_TOTAL_CAP", 900)),
+        max_reconnects=int(env("CBGRAM_MAX_RECONNECTS", 8)),
     )
     rpc_type = raw.functions.upload.SaveBigFilePart if is_big else raw.functions.upload.SaveFilePart
 
