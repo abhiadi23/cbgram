@@ -17,6 +17,7 @@
 #  along with Pyrogram.  If not, see <http://www.gnu.org/licenses/>.
 
 import asyncio
+import sqlite3
 import contextlib
 import functools
 import inspect
@@ -1195,10 +1196,16 @@ class Client(Methods):
             if usernames:
                 parsed_usernames.append((peer_id, usernames))
 
-        await self.storage.update_peers(parsed_peers)
+        try:
+            await self.storage.update_peers(parsed_peers)
 
-        if parsed_usernames:
-            await self.storage.update_usernames(parsed_usernames)
+            if parsed_usernames:
+                await self.storage.update_usernames(parsed_usernames)
+        except (sqlite3.Error, ValueError) as e:
+            # The peer cache is only a cache. If its connection is closed or being reopened
+            # (e.g. while every session restarts at once) losing this write is harmless, whereas
+            # letting it escape drops the whole update that carried these peers.
+            log.warning("Could not save %d peer(s) to the session storage: %s: %s", len(parsed_peers), type(e).__name__, e)
 
         return is_min
 
@@ -2486,4 +2493,3 @@ class Cache:
 
         if len(self.store) > self.capacity:
             self.store.popitem(last=False)
-
