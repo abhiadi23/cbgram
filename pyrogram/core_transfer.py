@@ -180,6 +180,38 @@ def _flags(client):
     )
 
 
+# ---- speed policy -------------------------------------------------------------------------------
+# One stable band for bots and normal accounts, expressed in MiB/s and converted to requests/s from
+# the chunk size, so a small file and a huge one see the same limits:
+#   start  - where every transfer begins (no slow ramp from a few MiB/s: small files finish before it ends)
+#   max    - the ceiling the pacer probes to and never exceeds
+# On a flood the pacer backs off gently, never below roughly half the band unless the server keeps
+# refusing, and climbs straight back (see cbcrypto's pacer). Premium accounts keep their own limits.
+TARGET_START_MIBS = 32.0
+TARGET_MAX_MIBS = 50.0
+BAND_GROWTH = 1.1    # ramp inside the band: +10% per quarter second, so a limit is met gently, not overshot
+DOWNLOAD_POOL = 10   # parallel connections: one connection carries only a few MiB/s, so this sets the plateau
+
+
+def _band(chunk: int):
+    """(start, max) in requests/s for chunks of ``chunk`` bytes."""
+    scale = (1024 * 1024) / chunk
+    env = os.environ.get
+    return (float(env("CBGRAM_TARGET_START", TARGET_START_MIBS)) * scale,
+            float(env("CBGRAM_TARGET_MAX", TARGET_MAX_MIBS)) * scale)
+
+
+def _download_chunk(file_size: int, pool: int) -> int:
+    """Smaller chunks for small files so that all connections get work: a 4 MiB file is 4 chunks of
+    1 MiB (4 connections, 1 each) but 8 chunks of 512 KiB (8 connections). Telegram accepts any limit
+    that divides 1 MiB and is a multiple of 4 KiB."""
+    if file_size < 2 * 1024 * 1024:
+        return 256 * 1024
+    if file_size < pool * 1024 * 1024:
+        return 512 * 1024
+    return CHUNK_SIZE
+
+
 def _slow_start():
     return os.environ.get("CBGRAM_SLOW_START", "1") != "0"
 
@@ -197,15 +229,21 @@ async def download(client, file_id, file_size: int, file, progress, progress_arg
         is_bot, is_premium = _flags(client)
         env = os.environ.get
 
-        if is_bot:
-            pool, workers = int(env("CBGRAM_DL_POOL_BOT", 5)), int(env("CBGRAM_DL_WORKERS_BOT", 3))
-            rate, burst = int(env("CBGRAM_DL_RATE_BOT", 16)), int(env("CBGRAM_DL_BURST_BOT", 8))
-        elif is_premium:
+        if is_premium and not is_bot:
             pool, workers = int(env("CBGRAM_DL_POOL_PREMIUM", 6)), int(env("CBGRAM_DL_WORKERS_PREMIUM", 4))
+            chunk = CHUNK_SIZE
             rate, burst = int(env("CBGRAM_DL_RATE_PREMIUM", 150)), int(env("CBGRAM_DL_BURST_PREMIUM", 35))
+            ceiling = float(max(rate, 150))
+            cap = float(env("CBGRAM_DL_SLOWSTART_CAP", 40))
         else:
-            pool, workers = int(env("CBGRAM_DL_POOL_USER", 5)), int(env("CBGRAM_DL_WORKERS_USER", 3))
-            rate, burst = int(env("CBGRAM_DL_RATE_USER", 8)), int(env("CBGRAM_DL_BURST_USER", 8))
+            kind = "BOT" if is_bot else "USER"
+            pool, workers = int(env(f"CBGRAM_DL_POOL_{kind}", DOWNLOAD_POOL)), int(env(f"CBGRAM_DL_WORKERS_{kind}", 3))
+            chunk = _download_chunk(file_size, pool)
+            start, top = _band(chunk)
+            rate = int(env(f"CBGRAM_DL_RATE_{kind}", round(start)))
+            burst = int(env(f"CBGRAM_DL_BURST_{kind}", 8))
+            cap = float(env("CBGRAM_DL_SLOWSTART_CAP", top))
+            ceiling = float(max(rate, cap))
 
         session, host, port = await _endpoint(client, dc_id)
         tracker = _Progress(client, progress, progress_args, file_size)
@@ -222,15 +260,15 @@ async def download(client, file_id, file_size: int, file, progress, progress_arg
             req_prefix=prefix,
             path=path,
             file_size=file_size,
-            chunk_size=CHUNK_SIZE,
-            connections=max(1, min(pool, math.ceil(file_size / CHUNK_SIZE))),
+            chunk_size=chunk,
+            connections=max(1, min(pool, math.ceil(file_size / chunk))),
             inflight=max(1, workers),
             paced=is_bot or not is_premium,
             rate=float(rate),
             burst=float(burst),
-            ceiling=float(max(rate, 150)),
-            growth=float(env("CBGRAM_DL_GROWTH", 1.5)) if _slow_start() else 1.0,
-            slow_start_cap=float(env("CBGRAM_DL_SLOWSTART_CAP", 40)),
+            ceiling=ceiling,
+            growth=float(env("CBGRAM_DL_GROWTH", 1.5 if is_premium and not is_bot else BAND_GROWTH)) if _slow_start() else 1.0,
+            slow_start_cap=cap,
             time_offset=float(MsgId.time_offset),
             recv_buffer=_socket_buffer(),
             read_timeout=float(Session.MEDIA_WAIT_TIMEOUT),
@@ -268,17 +306,20 @@ async def upload(client, path, progress, progress_args):
     env = os.environ.get
     total_parts = math.ceil(file_size / PART_SIZE)
     is_big = file_size > 10 * 1024 * 1024
-    pool_cap = max(1, math.ceil(total_parts / 2))
+    pool_cap = max(1, total_parts)  # the engine shares parts out evenly, so every connection gets work
 
-    if is_bot:
-        rate = int(env("CBGRAM_UPLOAD_RATE_BOT", 32))
-        pool = min(int(env("CBGRAM_UPLOAD_POOL_BOT", 8)), UPLOAD_POOL_MAX, pool_cap)
-    elif is_premium:
+    if is_premium and not is_bot:
         rate = int(env("CBGRAM_UPLOAD_RATE_PREMIUM", 300))
         pool = min(int(env("CBGRAM_UPLOAD_POOL_PREMIUM", 14)), UPLOAD_POOL_MAX, pool_cap)
+        ceiling = float(max(rate, 300))
+        cap = float(env("CBGRAM_UPLOAD_SLOWSTART_CAP", 80))
     else:
-        rate = int(env("CBGRAM_UPLOAD_RATE_USER", 32))
-        pool = min(int(env("CBGRAM_UPLOAD_POOL_USER", 12)), UPLOAD_POOL_MAX, pool_cap)
+        kind = "BOT" if is_bot else "USER"
+        start, top = _band(PART_SIZE)
+        rate = int(env(f"CBGRAM_UPLOAD_RATE_{kind}", round(start)))
+        pool = min(int(env(f"CBGRAM_UPLOAD_POOL_{kind}", 12)), UPLOAD_POOL_MAX, pool_cap)
+        cap = float(env("CBGRAM_UPLOAD_SLOWSTART_CAP", top))
+        ceiling = float(max(rate, cap))
 
     with open(path, "rb") as fp:
         file_name = utils.get_file_name(fp, fallback="file.jpg")
@@ -309,11 +350,11 @@ async def upload(client, path, progress, progress_args):
         inflight=2,
         paced=is_bot or not is_premium,
         rate=float(rate),
-        burst=16.0,
-        ceiling=float(max(rate, 300)),
+        burst=float(max(16, round(rate * 0.5))),
+        ceiling=ceiling,
         step=1.0,
-        growth=float(env("CBGRAM_UPLOAD_GROWTH", 1.5)) if _slow_start() else 1.0,
-        slow_start_cap=float(env("CBGRAM_UPLOAD_SLOWSTART_CAP", 80)),
+        growth=float(env("CBGRAM_UPLOAD_GROWTH", 1.5 if is_premium and not is_bot else BAND_GROWTH)) if _slow_start() else 1.0,
+        slow_start_cap=cap,
         time_offset=float(MsgId.time_offset),
         recv_buffer=_socket_buffer(),
         read_timeout=float(Session.MEDIA_WAIT_TIMEOUT),
