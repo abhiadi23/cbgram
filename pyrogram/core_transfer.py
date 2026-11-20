@@ -33,6 +33,7 @@ log = logging.getLogger(__name__)
 CHUNK_SIZE = 1024 * 1024
 PART_SIZE = 512 * 1024
 UPLOAD_POOL_MAX = 20
+UPLOAD_WORKERS_DEFAULT = 3
 
 
 def enabled(client) -> bool:
@@ -193,6 +194,28 @@ BAND_GROWTH = 1.1    # ramp inside the band: +10% per quarter second, so a limit
 DOWNLOAD_POOL = 10   # parallel connections: one connection carries only a few MiB/s, so this sets the plateau
 
 
+def _log_transfer(kind: str, file_size: int, pool: int, workers: int, part: int, rate: float, ceiling: float) -> None:
+    """One line per transfer: what window and pace the engine was given, and whether the clock is sane.
+
+    The engine copies ``MsgId.time_offset`` at start. A wrong offset there makes every msg_id it sends
+    look hours old, so the server rejects them and the transfer crawls or restarts.
+    """
+    window_mib = pool * workers * part / (1024 * 1024)
+    log.info(
+        "%s: %.1f MiB, %d connections x %d in flight x %d KiB = %.1f MiB window "
+        "(max ~%.0f MiB/s at 0.5 s round trip), pace %.0f..%.0f req/s",
+        kind, file_size / (1024 * 1024), pool, workers, part // 1024, window_mib,
+        window_mib / 0.5, rate, ceiling,
+    )
+
+    if abs(MsgId.time_offset) > 30:
+        log.warning(
+            "%s starts with a clock offset of %.1fs: msg_ids will look wrong to Telegram and the "
+            "transfer will stall. Check for a stale clock sample (see MsgId.sync).",
+            kind, MsgId.time_offset,
+        )
+
+
 def _band(chunk: int):
     """(start, max) in requests/s for chunks of ``chunk`` bytes."""
     scale = (1024 * 1024) / chunk
@@ -274,6 +297,8 @@ async def download(client, file_id, file_size: int, file, progress, progress_arg
             read_timeout=float(Session.MEDIA_WAIT_TIMEOUT),
         )
 
+        _log_transfer("download", file_size, pool, workers, chunk, rate, ceiling)
+
         try:
             await _run_engine(tracker, call, raw.functions.upload.GetFile)
         except CdnRedirect:
@@ -309,6 +334,7 @@ async def upload(client, path, progress, progress_args):
     pool_cap = max(1, total_parts)  # the engine shares parts out evenly, so every connection gets work
 
     if is_premium and not is_bot:
+        workers = int(env("CBGRAM_UPLOAD_WORKERS_PREMIUM", 2))
         rate = int(env("CBGRAM_UPLOAD_RATE_PREMIUM", 300))
         pool = min(int(env("CBGRAM_UPLOAD_POOL_PREMIUM", 14)), UPLOAD_POOL_MAX, pool_cap)
         ceiling = float(max(rate, 300))
@@ -316,6 +342,11 @@ async def upload(client, path, progress, progress_args):
     else:
         kind = "BOT" if is_bot else "USER"
         start, top = _band(PART_SIZE)
+        # requests in flight per connection. Throughput of a connection is (in-flight bytes / round trip),
+        # so with 2 here a 12-connection pool only keeps 12 MiB in the air: at 0.6 s per SaveBigFilePart
+        # that is ~20 MiB/s no matter what the pacer allows. The pacer still caps requests/s, so a bigger
+        # window cannot raise the request rate, it only lets the paced rate be reached.
+        workers = int(env(f"CBGRAM_UPLOAD_WORKERS_{kind}", UPLOAD_WORKERS_DEFAULT))
         rate = int(env(f"CBGRAM_UPLOAD_RATE_{kind}", round(start)))
         pool = min(int(env(f"CBGRAM_UPLOAD_POOL_{kind}", 12)), UPLOAD_POOL_MAX, pool_cap)
         cap = float(env("CBGRAM_UPLOAD_SLOWSTART_CAP", top))
@@ -347,7 +378,7 @@ async def upload(client, path, progress, progress_args):
         part_size=PART_SIZE,
         is_big=is_big,
         connections=max(1, pool),
-        inflight=2,
+        inflight=max(1, workers),
         paced=is_bot or not is_premium,
         rate=float(rate),
         burst=float(max(16, round(rate * 0.5))),
@@ -360,6 +391,8 @@ async def upload(client, path, progress, progress_args):
         read_timeout=float(Session.MEDIA_WAIT_TIMEOUT),
     )
     rpc_type = raw.functions.upload.SaveBigFilePart if is_big else raw.functions.upload.SaveFilePart
+
+    _log_transfer("upload", file_size, pool, workers, PART_SIZE, rate, ceiling)
 
     try:
         await _run_engine(tracker, call, rpc_type)
