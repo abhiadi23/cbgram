@@ -32,6 +32,7 @@ import pyrogram
 from pyrogram import StopTransmission
 from pyrogram import raw
 from pyrogram import utils
+from pyrogram.flood import FloodController
 from pyrogram.errors import RPCError, Flood
 from pyrogram.methods.rate_limiter import AdaptiveBucket
 from pyrogram.session import Session
@@ -144,8 +145,15 @@ class SaveFile:
                         budget.release()
 
             async def _send_part(session, data):
+                flood = getattr(self, "flood", None)
+                flood = flood if isinstance(flood, FloodController) else None
+
                 for attempt in range(MAX_RETRIES):
                     try:
+                        if flood is not None:
+                            # a flood already opened by another part: do not add a request to it
+                            await flood.wait(data, sleep=asyncio.sleep)
+
                         if not await session.invoke(
                             data, timeout=Session.MEDIA_WAIT_TIMEOUT, sleep_threshold=0
                         ):
@@ -176,7 +184,12 @@ class SaveFile:
                             "Retrying upload part (attempt %d/%d): %s",
                             attempt + 1, MAX_RETRIES, err_str[:120],
                         )
-                        await asyncio.sleep(delay)
+                        if flood is not None and isinstance(e, Flood):
+                            # every part that was in flight gets this error; they must share ONE
+                            # deadline, not each sleep and retry separately (a retry storm)
+                            await flood.flood(flood.method_name(data), delay, sleep=asyncio.sleep)
+                        else:
+                            await asyncio.sleep(delay)
 
             async def read_batch():
                 batch_size = min(PART_SIZE * n_workers, MAX_BATCH)
