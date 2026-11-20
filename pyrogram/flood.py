@@ -196,7 +196,7 @@ class FloodController:
         jitter: float = 0.25,
         max_tracked_peers: int = 4096,
         clock: Callable[[], float] = time.monotonic,
-        sleep: Callable[[float], Any] = asyncio.sleep,
+        sleep: Optional[Callable[[float], Any]] = None,
     ):
         self.enabled = enabled
         self._concurrency = concurrency
@@ -207,7 +207,7 @@ class FloodController:
         self._ceiling = ceiling_rate
         self._jitter = jitter
         self._clock = clock
-        self._sleep = sleep
+        self._sleep = sleep  # None: use asyncio.sleep, looked up at call time (so patching it works)
         self._max_peers = max_tracked_peers
 
         self._methods: Dict[str, _Method] = {}
@@ -319,8 +319,12 @@ class FloodController:
             m.recent.append(self._clock())
             return Ticket(self, m, limiter)
 
-    async def _wait_cooldown(self, m: _Method, sleep_threshold: float):
-        while True:
+    async def _nap(self, seconds: float):
+        await (self._sleep or asyncio.sleep)(seconds)
+
+    async def _wait_cooldown(self, m: _Method, sleep_threshold: float, nap=None):
+        # bounded: one pass normally, a few if the cooldown keeps being extended by new floods
+        for _ in range(64):
             left = m.cooldown_until - self._clock()
 
             if left <= 0:
@@ -334,7 +338,7 @@ class FloodController:
 
             self.stats_shared_waits += 1
             m.waited += left
-            await self._sleep(left + random.uniform(0, self._jitter))
+            await (nap or self._nap)(left + random.uniform(0, self._jitter))
 
     # -------------------------------------------------------------- feedback
 
@@ -402,11 +406,22 @@ class FloodController:
                 m.bucket.rate = m.rate
                 m.bucket._burst = max(1.0, m.rate)
 
-    async def flood(self, name: str, seconds: float):
+    async def wait(self, query, sleep_threshold: float = -1, sleep=None):
+        """Wait out a running cooldown for ``query``'s method, if there is one. For callers that
+        send without going through :meth:`acquire` (e.g. upload parts)."""
+        if not self.enabled:
+            return
+
+        m = self._methods.get(self.method_name(query))
+
+        if m is not None:
+            await self._wait_cooldown(m, sleep_threshold, sleep)
+
+    async def flood(self, name: str, seconds: float, sleep=None):
         """Called by the session in place of ``asyncio.sleep`` when a call is told to
         wait. Every concurrent caller shares one deadline; the one that opened it
         also lowers the rate, and each hands its concurrency slot back meanwhile."""
-        self.note_flood(name, seconds)
+        opened = self.note_flood(name, seconds)
         m = self._methods[name]
 
         ticket = _current_ticket.get()
@@ -417,7 +432,14 @@ class FloodController:
             ticket.limiter.release()
 
         try:
-            await self._wait_cooldown(m, -1)
+            nap = sleep or self._nap
+
+            if opened:
+                # the call that was told to wait sleeps exactly what the server asked ...
+                await nap(seconds)
+
+            # ... everyone else (and anything the cooldown was extended by) joins the shared deadline
+            await self._wait_cooldown(m, -1, nap)
         finally:
             if lent and not ticket.done:
                 await ticket.limiter.acquire(1)
