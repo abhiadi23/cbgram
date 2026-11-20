@@ -154,6 +154,10 @@ class _MsgIdGenerator:
     _base_wall = time.time()
     _base_mono = time.monotonic()
     time_offset = 0.0
+    # Highest server timestamp (seconds) ever adopted. Server time only moves forward, so a later
+    # sample that is clearly older than this is a stale/replayed packet, not a clock reading.
+    _server_hi = 0.0
+    STALE_TOLERANCE = 10.0
 
     @classmethod
     def now(cls) -> float:
@@ -168,7 +172,20 @@ class _MsgIdGenerator:
         that sat in the socket while the event loop was blocked is minutes old and says nothing about the clock.
         """
         wall = time.time()
-        offset = (server_msg_id >> 32) - wall
+        server_ts = server_msg_id >> 32
+        offset = server_ts - wall
+
+        # The first packet of every fresh session used to be adopted blindly, and this class is
+        # process-wide: one stale packet (an old msg_id read from the socket right after a reconnect)
+        # moved the clock for every bot and for the Rust engines, which copy time_offset at start.
+        # Server time never goes backwards, so refuse samples older than what we already accepted.
+        # A rejection from the server itself (bad_msg_notification 16/17) stays authoritative.
+        if not rejected and server_ts < cls._server_hi - cls.STALE_TOLERANCE:
+            log.debug(
+                "Ignoring a stale server msg_id (%.1fs older than the newest accepted one)",
+                cls._server_hi - server_ts,
+            )
+            return False
 
         if not rejected and watchdog.stalled_recently() and abs(offset - cls.time_offset) > 5:
             log.debug(
@@ -181,6 +198,7 @@ class _MsgIdGenerator:
             cls._base_wall = wall
             cls._base_mono = time.monotonic()
             cls.time_offset = offset
+            cls._server_hi = max(cls._server_hi, float(server_ts)) if not rejected else float(server_ts)
 
             if rejected:
                 cls._last_msg_id = 0
