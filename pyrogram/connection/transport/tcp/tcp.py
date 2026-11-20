@@ -463,6 +463,9 @@ class TCP:
                 await asyncio.wait_for(self.writer.wait_closed(), TCP.TIMEOUT)
             elif self.socket is not None:
                 self.socket.close()
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, asyncio.TimeoutError) as e:
+            # the other side (or the network) already dropped the connection: nothing to close, nothing to report
+            log.debug("Connection was already gone when closing: %s %s", type(e).__name__, e)
         except Exception as e:
             log.info("Close exception: %s %s", type(e).__name__, e)
 
