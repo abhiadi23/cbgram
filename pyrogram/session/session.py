@@ -17,6 +17,7 @@
 #  along with Pyrogram.  If not, see <http://www.gnu.org/licenses/>.
 
 import asyncio
+import random
 import bisect
 import logging
 import os
@@ -43,6 +44,7 @@ from pyrogram.errors import (
 from pyrogram.raw.all import layer
 from pyrogram.raw.core import TLObject, Message, MsgContainer, Int, FutureSalts, tl_native
 from .internals import MsgId, MsgFactory
+from .internals.msg_id import watchdog
 
 log = logging.getLogger(__name__)
 
@@ -81,6 +83,37 @@ class Result:
 
 class ConnectionLost:
     pass
+
+
+class RestartStagger:
+    """Spreads out session restarts that happen at the same moment.
+
+    When the event loop stalls (or the network blips) every session in the process loses its
+    connection together, and dozens of them would reconnect to the same DC in the same
+    millisecond. A lone reconnect stays instant; only a burst is spread over a few seconds.
+    """
+
+    WINDOW = 2.0     # seconds a restart counts as "recent"
+    FREE = 3         # restarts per window that go through immediately
+    PER_EXTRA = 0.05
+    MAX_DELAY = 4.0
+
+    def __init__(self):
+        self._recent = []
+
+    def delay(self, now: float = None) -> float:
+        now = time.monotonic() if now is None else now
+        self._recent = [t for t in self._recent if now - t < self.WINDOW]
+        n = len(self._recent)
+        self._recent.append(now)
+
+        if n < self.FREE:
+            return 0.0
+
+        return random.uniform(0.0, min((n - self.FREE + 1) * self.PER_EXTRA * 2, self.MAX_DELAY))
+
+
+restart_stagger = RestartStagger()
 
 
 class Session:
@@ -178,6 +211,9 @@ class Session:
         self.last_used = time.monotonic()
 
     async def start(self, max_attempts: Optional[int] = None):
+        # watches for a blocked event loop (see LoopWatchdog); no-op after the first call
+        watchdog.ensure_started(self.loop)
+
         self._stopping = False
         self._start_exc = None
         self._start_active = True
@@ -672,6 +708,7 @@ class Session:
                 self._fail_pending(ConnectionResetError(str(e) or type(e).__name__))
 
                 if self.is_started.is_set():
+                    await asyncio.sleep(restart_stagger.delay())
                     await self._safe_restart()
                 break
 
@@ -683,6 +720,7 @@ class Session:
                 self._fail_pending(ConnectionResetError(reason))
 
                 if self.is_started.is_set():
+                    await asyncio.sleep(restart_stagger.delay())
                     await self._safe_restart()
 
                 break
