@@ -127,6 +127,7 @@ class _Progress:
             line += f", first byte after {self.first_byte:.1f}s"
         if rates:
             line += f", per-second speed min {min(rates):.1f} / max {max(rates):.1f} MiB/s, stalled seconds {sum(r < 0.5 for r in rates)}"
+            line += ", first seconds " + " ".join(f"{r:.0f}" for r in rates[:8])
         return line
 
     # runs on the event loop
