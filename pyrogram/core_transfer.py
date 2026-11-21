@@ -17,6 +17,7 @@ import logging
 import math
 import os
 import threading
+import time
 from typing import Callable, Optional, Union
 
 import cbcrypto
@@ -91,6 +92,10 @@ class _Progress:
         self._latest = 0
         self._sent = -1
         self._task: Optional[asyncio.Task] = None
+        self.start = time.monotonic()
+        self.first_byte: Optional[float] = None   # seconds until the first byte moved
+        self._samples: list = [(0.0, 0)]          # (seconds, bytes) about once a second, for the summary
+        self._last_sample = self.start
 
     # runs in the engine thread
     def tick(self, done: int) -> None:
@@ -98,9 +103,31 @@ class _Progress:
             raise _Cancelled()
         if self.stop_exc is not None:
             raise self.stop_exc
+        now = time.monotonic()
+        if done > 0 and self.first_byte is None:
+            self.first_byte = now - self.start
+        if now - self._last_sample >= 1.0:
+            self._last_sample = now
+            self._samples.append((now - self.start, done))
         if self.callback and done != self._latest:
             self._latest = done
             self.loop.call_soon_threadsafe(self._kick)
+
+    def summary(self, kind: str) -> str:
+        """One line: how long it took and how steady the speed was (tells a slow link from floods/stalls)."""
+        elapsed = time.monotonic() - self.start
+        mib = self.total / (1024 * 1024)
+        rates = [
+            (d2 - d1) / (t2 - t1) / (1024 * 1024)
+            for (t1, d1), (t2, d2) in zip(self._samples, self._samples[1:])
+            if t2 > t1
+        ]
+        line = f"{kind} done: {mib:.1f} MiB in {elapsed:.1f}s = {mib / elapsed if elapsed else 0:.1f} MiB/s"
+        if self.first_byte is not None:
+            line += f", first byte after {self.first_byte:.1f}s"
+        if rates:
+            line += f", per-second speed min {min(rates):.1f} / max {max(rates):.1f} MiB/s, stalled seconds {sum(r < 0.5 for r in rates)}"
+        return line
 
     # runs on the event loop
     def _kick(self) -> None:
@@ -150,12 +177,14 @@ def _raise_core_error(e: "cbcrypto.CoreError", rpc_type) -> None:
     raise OSError(f"{kind}: {message}") from None
 
 
-async def _run_engine(progress: _Progress, fn: Callable, rpc_type):
+async def _run_engine(progress: _Progress, fn: Callable, rpc_type, kind: str = "transfer"):
     """Run a blocking engine call in a worker thread; an asyncio cancel stops it cleanly."""
     loop = asyncio.get_running_loop()
     fut = loop.run_in_executor(None, functools.partial(fn, progress=progress.tick))
     try:
-        return await asyncio.shield(fut)
+        result = await asyncio.shield(fut)
+        log.info("%s", progress.summary(kind))
+        return result
     except asyncio.CancelledError:
         progress.cancelled.set()
         try:
@@ -342,7 +371,7 @@ async def download(client, file_id, file_size: int, file, progress, progress_arg
         _log_transfer("download", file_size, pool, workers, chunk, rate, ceiling)
 
         try:
-            await _run_engine(tracker, call, raw.functions.upload.GetFile)
+            await _run_engine(tracker, call, raw.functions.upload.GetFile, "download")
         except CdnRedirect:
             return False
         await tracker.finish()
@@ -445,7 +474,7 @@ async def upload(client, path, progress, progress_args):
     _log_transfer("upload", file_size, pool, workers, PART_SIZE, rate, ceiling)
 
     try:
-        await _run_engine(tracker, call, rpc_type)
+        await _run_engine(tracker, call, rpc_type, "upload")
     except BaseException:
         if md5_task is not None:
             md5_task.cancel()
