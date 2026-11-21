@@ -32,12 +32,41 @@ log = logging.getLogger(__name__)
 
 CHUNK_SIZE = 1024 * 1024
 PART_SIZE = 512 * 1024
-UPLOAD_POOL_MAX = 20
-UPLOAD_WORKERS_DEFAULT = 3
+UPLOAD_POOL_MAX = 32
+UPLOAD_WORKERS_DEFAULT = 4
+UPLOAD_POOL_DEFAULT = 16
+DOWNLOAD_WORKERS_DEFAULT = 4
+
+_warned_fallback: set = set()
+
+
+def _accepts(fn, name: str) -> bool:
+    """True if the compiled engine function takes keyword ``name`` (older cbcrypto builds do not)."""
+    return name in (getattr(fn, "__text_signature__", None) or "")
+
+
+def _fallback(kind: str, reason: str) -> None:
+    """Say once per reason why a transfer is NOT using the Rust engine.
+
+    The Python path is 2-4x slower and floods much more; running on it by accident (stale install,
+    proxy, env switch) looks exactly like 'Telegram is slow' unless it is logged.
+    """
+    key = (kind, reason)
+    if key not in _warned_fallback:
+        _warned_fallback.add(key)
+        log.warning("%s is NOT using the Rust engine (%s): falling back to the slow Python path", kind, reason)
 
 
 def enabled(client) -> bool:
     return os.environ.get("CBGRAM_RUST_CORE", "1") != "0" and not client.proxy
+
+
+def _why_disabled(client) -> str:
+    if os.environ.get("CBGRAM_RUST_CORE", "1") == "0":
+        return "CBGRAM_RUST_CORE=0"
+    if client.proxy:
+        return "a proxy is configured"
+    return "unknown"
 
 
 class CdnRedirect(Exception):
@@ -188,10 +217,11 @@ def _flags(client):
 #   max    - the ceiling the pacer probes to and never exceeds
 # On a flood the pacer backs off gently, never below roughly half the band unless the server keeps
 # refusing, and climbs straight back (see cbcrypto's pacer). Premium accounts keep their own limits.
-TARGET_START_MIBS = 32.0
-TARGET_MAX_MIBS = 50.0
+TARGET_START_MIBS = 45.0   # every transfer starts here: files of any size are at speed from the first second
+TARGET_MAX_MIBS = 60.0     # ceiling the pacer probes to; sitting between 45 and 60 averages ~50 MiB/s
+TARGET_FLOOR_MIBS = 20.0   # a flood storm dips to here (the 20-30 band), never to a crawl, and climbs back
 BAND_GROWTH = 1.1    # ramp inside the band: +10% per quarter second, so a limit is met gently, not overshot
-DOWNLOAD_POOL = 10   # parallel connections: one connection carries only a few MiB/s, so this sets the plateau
+DOWNLOAD_POOL = 14   # parallel connections: one connection carries only a few MiB/s, so this sets the plateau
 
 
 def _log_transfer(kind: str, file_size: int, pool: int, workers: int, part: int, rate: float, ceiling: float) -> None:
@@ -224,6 +254,11 @@ def _band(chunk: int):
             float(env("CBGRAM_TARGET_MAX", TARGET_MAX_MIBS)) * scale)
 
 
+def _floor(chunk: int) -> float:
+    """Storm floor in requests/s for chunks of ``chunk`` bytes."""
+    return float(os.environ.get("CBGRAM_TARGET_FLOOR", TARGET_FLOOR_MIBS)) * (1024 * 1024) / chunk
+
+
 def _download_chunk(file_size: int, pool: int) -> int:
     """Smaller chunks for small files so that all connections get work: a 4 MiB file is 4 chunks of
     1 MiB (4 connections, 1 each) but 8 chunks of 512 KiB (8 connections). Telegram accepts any limit
@@ -243,7 +278,11 @@ async def download(client, file_id, file_size: int, file, progress, progress_arg
     """Download ``file_id`` into the open (pre-sized) local file. False = not handled, use Python."""
     path = getattr(file, "name", None)
 
-    if not enabled(client) or file_size <= 0 or not isinstance(path, str):
+    if not enabled(client):
+        _fallback("download", _why_disabled(client))
+        return False
+
+    if file_size <= 0 or not isinstance(path, str):
         return False
 
     async with client.get_file_semaphore:
@@ -257,16 +296,18 @@ async def download(client, file_id, file_size: int, file, progress, progress_arg
             chunk = CHUNK_SIZE
             rate, burst = int(env("CBGRAM_DL_RATE_PREMIUM", 150)), int(env("CBGRAM_DL_BURST_PREMIUM", 35))
             ceiling = float(max(rate, 150))
+            floor = 1.0
             cap = float(env("CBGRAM_DL_SLOWSTART_CAP", 40))
         else:
             kind = "BOT" if is_bot else "USER"
-            pool, workers = int(env(f"CBGRAM_DL_POOL_{kind}", DOWNLOAD_POOL)), int(env(f"CBGRAM_DL_WORKERS_{kind}", 3))
+            pool, workers = int(env(f"CBGRAM_DL_POOL_{kind}", DOWNLOAD_POOL)), int(env(f"CBGRAM_DL_WORKERS_{kind}", DOWNLOAD_WORKERS_DEFAULT))
             chunk = _download_chunk(file_size, pool)
             start, top = _band(chunk)
             rate = int(env(f"CBGRAM_DL_RATE_{kind}", round(start)))
             burst = int(env(f"CBGRAM_DL_BURST_{kind}", 8))
             cap = float(env("CBGRAM_DL_SLOWSTART_CAP", top))
             ceiling = float(max(rate, cap))
+            floor = _floor(chunk)
 
         session, host, port = await _endpoint(client, dc_id)
         tracker = _Progress(client, progress, progress_args, file_size)
@@ -295,6 +336,7 @@ async def download(client, file_id, file_size: int, file, progress, progress_arg
             time_offset=float(MsgId.time_offset),
             recv_buffer=_socket_buffer(),
             read_timeout=float(Session.MEDIA_WAIT_TIMEOUT),
+            **({"floor": floor} if _accepts(cbcrypto.download, "floor") else {}),
         )
 
         _log_transfer("download", file_size, pool, workers, chunk, rate, ceiling)
@@ -309,7 +351,12 @@ async def download(client, file_id, file_size: int, file, progress, progress_arg
 
 async def upload(client, path, progress, progress_args):
     """Upload a local file by path. Returns InputFile/InputFileBig, or NotImplemented = use Python."""
-    if not enabled(client) or not isinstance(path, (str, os.PathLike)):
+    if not enabled(client):
+        _fallback("upload", _why_disabled(client))
+        return NotImplemented
+
+    if not isinstance(path, (str, os.PathLike)):
+        _fallback("upload", "the source is a file object, not a path: pass the file path to get the Rust engine")
         return NotImplemented
 
     path = os.fspath(path)
@@ -339,18 +386,20 @@ async def upload(client, path, progress, progress_args):
         pool = min(int(env("CBGRAM_UPLOAD_POOL_PREMIUM", 14)), UPLOAD_POOL_MAX, pool_cap)
         ceiling = float(max(rate, 300))
         cap = float(env("CBGRAM_UPLOAD_SLOWSTART_CAP", 80))
+        floor = 1.0
     else:
         kind = "BOT" if is_bot else "USER"
         start, top = _band(PART_SIZE)
         # requests in flight per connection. Throughput of a connection is (in-flight bytes / round trip),
-        # so with 2 here a 12-connection pool only keeps 12 MiB in the air: at 0.6 s per SaveBigFilePart
-        # that is ~20 MiB/s no matter what the pacer allows. The pacer still caps requests/s, so a bigger
+        # so with 3 x 12 connections only 18 MiB are in the air: at 0.6 s per SaveBigFilePart that is
+        # ~30 MiB/s no matter what the pacer allows. 16 x 4 x 512 KiB = 32 MiB in the air lifts that to ~55. The pacer still caps requests/s, so a bigger
         # window cannot raise the request rate, it only lets the paced rate be reached.
         workers = int(env(f"CBGRAM_UPLOAD_WORKERS_{kind}", UPLOAD_WORKERS_DEFAULT))
         rate = int(env(f"CBGRAM_UPLOAD_RATE_{kind}", round(start)))
-        pool = min(int(env(f"CBGRAM_UPLOAD_POOL_{kind}", 12)), UPLOAD_POOL_MAX, pool_cap)
+        pool = min(int(env(f"CBGRAM_UPLOAD_POOL_{kind}", UPLOAD_POOL_DEFAULT)), UPLOAD_POOL_MAX, pool_cap)
         cap = float(env("CBGRAM_UPLOAD_SLOWSTART_CAP", top))
         ceiling = float(max(rate, cap))
+        floor = _floor(PART_SIZE)
 
     with open(path, "rb") as fp:
         file_name = utils.get_file_name(fp, fallback="file.jpg")
@@ -381,7 +430,7 @@ async def upload(client, path, progress, progress_args):
         inflight=max(1, workers),
         paced=is_bot or not is_premium,
         rate=float(rate),
-        burst=float(max(16, round(rate * 0.5))),
+        burst=float(max(16, round(rate * 0.25))),  # a smaller burst: a 50-request spike is itself a flood trigger
         ceiling=ceiling,
         step=1.0,
         growth=float(env("CBGRAM_UPLOAD_GROWTH", 1.5 if is_premium and not is_bot else BAND_GROWTH)) if _slow_start() else 1.0,
@@ -389,6 +438,7 @@ async def upload(client, path, progress, progress_args):
         time_offset=float(MsgId.time_offset),
         recv_buffer=_socket_buffer(),
         read_timeout=float(Session.MEDIA_WAIT_TIMEOUT),
+        **({"floor": floor} if _accepts(cbcrypto.upload, "floor") else {}),
     )
     rpc_type = raw.functions.upload.SaveBigFilePart if is_big else raw.functions.upload.SaveFilePart
 
