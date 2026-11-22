@@ -92,6 +92,7 @@ class _Progress:
         self._latest = 0
         self._sent = -1
         self._task: Optional[asyncio.Task] = None
+        self.stats: dict = {}                     # filled by the engine: floods, reconnects, timeouts...
         self.start = time.monotonic()
         self.first_byte: Optional[float] = None   # seconds until the first byte moved
         self._samples: list = [(0.0, 0)]          # (seconds, bytes) about once a second, for the summary
@@ -128,6 +129,11 @@ class _Progress:
         if rates:
             line += f", per-second speed min {min(rates):.1f} / max {max(rates):.1f} MiB/s, stalled seconds {sum(r < 0.5 for r in rates)}"
             line += ", first seconds " + " ".join(f"{r:.0f}" for r in rates[:8])
+        s = self.stats
+        if s:
+            line += (f" | floods {s.get('floods', 0)} ({s.get('flood_seconds', 0):.0f}s waited, longest {s.get('flood_max_seconds', 0):.0f}s)"
+                     f", reconnects {s.get('reconnects', 0)} (timeouts {s.get('timeouts', 0)})"
+                     f", pace at end {s.get('pace_end', 0) / 2:.0f} MiB/s")
         return line
 
     # runs on the event loop
@@ -367,6 +373,7 @@ async def download(client, file_id, file_size: int, file, progress, progress_arg
             recv_buffer=_socket_buffer(),
             read_timeout=float(Session.MEDIA_WAIT_TIMEOUT),
             **({"floor": floor} if _accepts(cbcrypto.download, "floor") else {}),
+            **({"stats": tracker.stats} if _accepts(cbcrypto.download, "stats") else {}),
         )
 
         _log_transfer("download", file_size, pool, workers, chunk, rate, ceiling)
@@ -469,6 +476,7 @@ async def upload(client, path, progress, progress_args):
         recv_buffer=_socket_buffer(),
         read_timeout=float(Session.MEDIA_WAIT_TIMEOUT),
         **({"floor": floor} if _accepts(cbcrypto.upload, "floor") else {}),
+        **({"stats": tracker.stats} if _accepts(cbcrypto.upload, "stats") else {}),
     )
     rpc_type = raw.functions.upload.SaveBigFilePart if is_big else raw.functions.upload.SaveFilePart
 
