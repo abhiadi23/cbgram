@@ -255,6 +255,7 @@ def _flags(client):
 # refusing, and climbs straight back (see cbcrypto's pacer). Premium accounts keep their own limits.
 TARGET_START_MIBS = 45.0   # every transfer starts here: files of any size are at speed from the first second
 TARGET_MAX_MIBS = 60.0     # ceiling the pacer probes to; sitting between 45 and 60 averages ~50 MiB/s
+UPLOAD_START_MIBS = 28.0   # uploads start here: logs show a bot account is flood-waited above ~25-30 MiB/s, starting at 45 floods in the first second
 TARGET_FLOOR_MIBS = 20.0   # a flood storm dips to here (the 20-30 band), never to a crawl, and climbs back
 BAND_GROWTH = 1.1    # ramp inside the band: +10% per quarter second, so a limit is met gently, not overshot
 DOWNLOAD_POOL = 14   # parallel connections: one connection carries only a few MiB/s, so this sets the plateau
@@ -427,6 +428,9 @@ async def upload(client, path, progress, progress_args):
     else:
         kind = "BOT" if is_bot else "USER"
         start, top = _band(PART_SIZE)
+        # start at a rate Telegram accepts and climb while there are no flood waits, instead of racing up
+        # to the maximum and being flooded on every file (3-4 floods, ~5 s frozen, then a cut to ~20)
+        start = float(env("CBGRAM_UPLOAD_START_MIBS", UPLOAD_START_MIBS)) * (1024 * 1024) / PART_SIZE
         # requests in flight per connection. Throughput of a connection is (in-flight bytes / round trip),
         # so with 3 x 12 connections only 18 MiB are in the air: at 0.6 s per SaveBigFilePart that is
         # ~30 MiB/s no matter what the pacer allows. 16 x 4 x 512 KiB = 32 MiB in the air lifts that to ~55. The pacer still caps requests/s, so a bigger
@@ -434,8 +438,8 @@ async def upload(client, path, progress, progress_args):
         workers = int(env(f"CBGRAM_UPLOAD_WORKERS_{kind}", UPLOAD_WORKERS_DEFAULT))
         rate = int(env(f"CBGRAM_UPLOAD_RATE_{kind}", round(start)))
         pool = min(int(env(f"CBGRAM_UPLOAD_POOL_{kind}", UPLOAD_POOL_DEFAULT)), UPLOAD_POOL_MAX, pool_cap)
-        cap = float(env("CBGRAM_UPLOAD_SLOWSTART_CAP", top))
-        ceiling = float(max(rate, cap))
+        cap = float(env("CBGRAM_UPLOAD_SLOWSTART_CAP", rate))  # = start rate: no exponential overshoot
+        ceiling = float(max(rate, top))
         floor = _floor(PART_SIZE)
 
     with open(path, "rb") as fp:
@@ -467,7 +471,7 @@ async def upload(client, path, progress, progress_args):
         inflight=max(1, workers),
         paced=is_bot or not is_premium,
         rate=float(rate),
-        burst=float(max(16, round(rate * 0.25))),  # a smaller burst: a 50-request spike is itself a flood trigger
+        burst=float(max(8, round(rate * 0.15))),  # small: a 30-request spike in the first second is itself a flood trigger
         ceiling=ceiling,
         step=1.0,
         growth=float(env("CBGRAM_UPLOAD_GROWTH", 1.5 if is_premium and not is_bot else BAND_GROWTH)) if _slow_start() else 1.0,
