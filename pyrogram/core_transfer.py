@@ -17,7 +17,6 @@ import logging
 import math
 import os
 import threading
-import time
 from typing import Callable, Optional, Union
 
 import cbcrypto
@@ -38,7 +37,11 @@ UPLOAD_WORKERS_DEFAULT = 4
 UPLOAD_POOL_DEFAULT = 16
 DOWNLOAD_WORKERS_DEFAULT = 4
 
-_warned_fallback: set = set()
+def _flood_log(rpc_name: str):
+    """The only log line of a transfer: Telegram asked us to wait, we retry after that many seconds."""
+    def on_flood(secs: float) -> None:
+        log.warning("FloodWait on %s: retrying after %d seconds", rpc_name, max(1, round(secs)))
+    return on_flood
 
 
 def _accepts(fn, name: str) -> bool:
@@ -46,28 +49,9 @@ def _accepts(fn, name: str) -> bool:
     return name in (getattr(fn, "__text_signature__", None) or "")
 
 
-def _fallback(kind: str, reason: str) -> None:
-    """Say once per reason why a transfer is NOT using the Rust engine.
-
-    The Python path is 2-4x slower and floods much more; running on it by accident (stale install,
-    proxy, env switch) looks exactly like 'Telegram is slow' unless it is logged.
-    """
-    key = (kind, reason)
-    if key not in _warned_fallback:
-        _warned_fallback.add(key)
-        log.warning("%s is NOT using the Rust engine (%s): falling back to the slow Python path", kind, reason)
-
-
 def enabled(client) -> bool:
     return os.environ.get("CBGRAM_RUST_CORE", "1") != "0" and not client.proxy
 
-
-def _why_disabled(client) -> str:
-    if os.environ.get("CBGRAM_RUST_CORE", "1") == "0":
-        return "CBGRAM_RUST_CORE=0"
-    if client.proxy:
-        return "a proxy is configured"
-    return "unknown"
 
 
 class CdnRedirect(Exception):
@@ -92,11 +76,6 @@ class _Progress:
         self._latest = 0
         self._sent = -1
         self._task: Optional[asyncio.Task] = None
-        self.stats: dict = {}                     # filled by the engine: floods, reconnects, timeouts...
-        self.start = time.monotonic()
-        self.first_byte: Optional[float] = None   # seconds until the first byte moved
-        self._samples: list = [(0.0, 0)]          # (seconds, bytes) about once a second, for the summary
-        self._last_sample = self.start
 
     # runs in the engine thread
     def tick(self, done: int) -> None:
@@ -104,37 +83,10 @@ class _Progress:
             raise _Cancelled()
         if self.stop_exc is not None:
             raise self.stop_exc
-        now = time.monotonic()
-        if done > 0 and self.first_byte is None:
-            self.first_byte = now - self.start
-        if now - self._last_sample >= 1.0:
-            self._last_sample = now
-            self._samples.append((now - self.start, done))
         if self.callback and done != self._latest:
             self._latest = done
             self.loop.call_soon_threadsafe(self._kick)
 
-    def summary(self, kind: str) -> str:
-        """One line: how long it took and how steady the speed was (tells a slow link from floods/stalls)."""
-        elapsed = time.monotonic() - self.start
-        mib = self.total / (1024 * 1024)
-        rates = [
-            (d2 - d1) / (t2 - t1) / (1024 * 1024)
-            for (t1, d1), (t2, d2) in zip(self._samples, self._samples[1:])
-            if t2 > t1
-        ]
-        line = f"{kind} done: {mib:.1f} MiB in {elapsed:.1f}s = {mib / elapsed if elapsed else 0:.1f} MiB/s"
-        if self.first_byte is not None:
-            line += f", first byte after {self.first_byte:.1f}s"
-        if rates:
-            line += f", per-second speed min {min(rates):.1f} / max {max(rates):.1f} MiB/s, stalled seconds {sum(r < 0.5 for r in rates)}"
-            line += ", first seconds " + " ".join(f"{r:.0f}" for r in rates[:8])
-        s = self.stats
-        if s:
-            line += (f" | floods {s.get('floods', 0)} ({s.get('flood_seconds', 0):.0f}s waited, longest {s.get('flood_max_seconds', 0):.0f}s)"
-                     f", reconnects {s.get('reconnects', 0)} (timeouts {s.get('timeouts', 0)})"
-                     f", pace at end {s.get('pace_end', 0) / 2:.0f} MiB/s")
-        return line
 
     # runs on the event loop
     def _kick(self) -> None:
@@ -184,14 +136,12 @@ def _raise_core_error(e: "cbcrypto.CoreError", rpc_type) -> None:
     raise OSError(f"{kind}: {message}") from None
 
 
-async def _run_engine(progress: _Progress, fn: Callable, rpc_type, kind: str = "transfer"):
+async def _run_engine(progress: _Progress, fn: Callable, rpc_type):
     """Run a blocking engine call in a worker thread; an asyncio cancel stops it cleanly."""
     loop = asyncio.get_running_loop()
     fut = loop.run_in_executor(None, functools.partial(fn, progress=progress.tick))
     try:
-        result = await asyncio.shield(fut)
-        log.info("%s", progress.summary(kind))
-        return result
+        return await asyncio.shield(fut)
     except asyncio.CancelledError:
         progress.cancelled.set()
         try:
@@ -253,10 +203,10 @@ def _flags(client):
 #   max    - the ceiling the pacer probes to and never exceeds
 # On a flood the pacer backs off gently, never below roughly half the band unless the server keeps
 # refusing, and climbs straight back (see cbcrypto's pacer). Premium accounts keep their own limits.
-TARGET_START_MIBS = 45.0   # every transfer starts here: files of any size are at speed from the first second
-TARGET_MAX_MIBS = 60.0     # ceiling the pacer probes to; sitting between 45 and 60 averages ~50 MiB/s
-UPLOAD_START_MIBS = 28.0   # uploads start here: logs show a bot account is flood-waited above ~25-30 MiB/s, starting at 45 floods in the first second
-TARGET_FLOOR_MIBS = 20.0   # a flood storm dips to here (the 20-30 band), never to a crawl, and climbs back
+TARGET_START_MIBS = 30.0   # downloads start here
+TARGET_MAX_MIBS = 40.0     # the highest rate the pacer will probe to
+UPLOAD_START_MIBS = 24.0   # uploads start here and climb to TARGET_MAX_MIBS while Telegram does not flood-wait
+TARGET_FLOOR_MIBS = 20.0   # a flood never cuts the rate below this
 BAND_GROWTH = 1.1    # ramp inside the band: +10% per quarter second, so a limit is met gently, not overshot
 DOWNLOAD_POOL = 14   # parallel connections: one connection carries only a few MiB/s, so this sets the plateau
 
@@ -315,11 +265,7 @@ async def download(client, file_id, file_size: int, file, progress, progress_arg
     """Download ``file_id`` into the open (pre-sized) local file. False = not handled, use Python."""
     path = getattr(file, "name", None)
 
-    if not enabled(client):
-        _fallback("download", _why_disabled(client))
-        return False
-
-    if file_size <= 0 or not isinstance(path, str):
+    if not enabled(client) or file_size <= 0 or not isinstance(path, str):
         return False
 
     async with client.get_file_semaphore:
@@ -374,13 +320,13 @@ async def download(client, file_id, file_size: int, file, progress, progress_arg
             recv_buffer=_socket_buffer(),
             read_timeout=float(Session.MEDIA_WAIT_TIMEOUT),
             **({"floor": floor} if _accepts(cbcrypto.download, "floor") else {}),
-            **({"stats": tracker.stats} if _accepts(cbcrypto.download, "stats") else {}),
+            **({"on_flood": _flood_log("upload.GetFile")} if _accepts(cbcrypto.download, "on_flood") else {}),
         )
 
         _log_transfer("download", file_size, pool, workers, chunk, rate, ceiling)
 
         try:
-            await _run_engine(tracker, call, raw.functions.upload.GetFile, "download")
+            await _run_engine(tracker, call, raw.functions.upload.GetFile)
         except CdnRedirect:
             return False
         await tracker.finish()
@@ -389,12 +335,7 @@ async def download(client, file_id, file_size: int, file, progress, progress_arg
 
 async def upload(client, path, progress, progress_args):
     """Upload a local file by path. Returns InputFile/InputFileBig, or NotImplemented = use Python."""
-    if not enabled(client):
-        _fallback("upload", _why_disabled(client))
-        return NotImplemented
-
-    if not isinstance(path, (str, os.PathLike)):
-        _fallback("upload", "the source is a file object, not a path: pass the file path to get the Rust engine")
+    if not enabled(client) or not isinstance(path, (str, os.PathLike)):
         return NotImplemented
 
     path = os.fspath(path)
@@ -480,14 +421,14 @@ async def upload(client, path, progress, progress_args):
         recv_buffer=_socket_buffer(),
         read_timeout=float(Session.MEDIA_WAIT_TIMEOUT),
         **({"floor": floor} if _accepts(cbcrypto.upload, "floor") else {}),
-        **({"stats": tracker.stats} if _accepts(cbcrypto.upload, "stats") else {}),
+        **({"on_flood": _flood_log("upload.SaveBigFilePart" if is_big else "upload.SaveFilePart")} if _accepts(cbcrypto.upload, "on_flood") else {}),
     )
     rpc_type = raw.functions.upload.SaveBigFilePart if is_big else raw.functions.upload.SaveFilePart
 
     _log_transfer("upload", file_size, pool, workers, PART_SIZE, rate, ceiling)
 
     try:
-        await _run_engine(tracker, call, rpc_type, "upload")
+        await _run_engine(tracker, call, rpc_type)
     except BaseException:
         if md5_task is not None:
             md5_task.cancel()
