@@ -47,6 +47,7 @@ from .internals import MsgId, MsgFactory
 from .internals.msg_id import watchdog
 
 log = logging.getLogger(__name__)
+flood_log = logging.getLogger("pyrogram.core_transfer")  # the one logger left audible: FloodWait lines
 
 # native (Rust) TL codec for the per-packet hot path; silently stays on the
 # generated Python classes if cbcrypto is too old or CBGRAM_NATIVE_TL=0
@@ -308,8 +309,8 @@ class Session:
                     backoff = min(e.value, 30)
                     # an unbounded start logs its way through an outage; at debug
                     # only, a client that cannot reach Telegram looks hung
-                    (log.warning if attempt >= 3 else log.debug)(
-                        "Session start attempt %d flood-limited, retrying in %ss",
+                    (flood_log.warning if attempt >= 3 else flood_log.debug)(
+                        "FloodWait: session start attempt %d flood-limited, retrying in %ss",
                         attempt, backoff
                     )
                     await asyncio.sleep(backoff)
@@ -902,7 +903,7 @@ class Session:
 
                 slept += amount
 
-                log.warning('[%s] Waiting for %s seconds before continuing (required by "%s")',
+                flood_log.warning('FloodWait [%s]: waiting for %s seconds before continuing (required by "%s")',
                             self.client.name, amount, query_name)
 
                 flood = getattr(self.client, "flood", None)
