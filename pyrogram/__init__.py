@@ -57,6 +57,15 @@ class ContinuePropagation(StopAsyncIteration):
     pass
 
 
+import logging as _logging
+
+# The library stays silent except for FloodWait lines: everything under "pyrogram" is muted and only
+# the transfer logger, which reports flood waits, is left at WARNING.
+# Set CBGRAM_LOGS=all to get the library's normal logging back (the test suite does).
+if _os.environ.get("CBGRAM_LOGS", "flood") != "all":
+    _logging.getLogger(__name__).setLevel(_logging.CRITICAL + 1)
+    _logging.getLogger(__name__ + ".core_transfer").setLevel(_logging.WARNING)
+
 from . import raw, types, filters, handlers, enums
 from .client import Client
 from .methods.utilities.idle import idle
