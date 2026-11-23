@@ -1,3 +1,7 @@
+import os as _os
+
+_os.environ.setdefault("CBGRAM_LOGS", "all")  # the library is silent by default; tests read its logs
+
 import os
 
 import pytest
