@@ -33,7 +33,7 @@ log = logging.getLogger(__name__)
 CHUNK_SIZE = 1024 * 1024
 PART_SIZE = 512 * 1024
 UPLOAD_POOL_MAX = 50
-UPLOAD_WORKERS_DEFAULT = 5
+UPLOAD_WORKERS_DEFAULT = 8
 UPLOAD_POOL_DEFAULT = 18
 DOWNLOAD_WORKERS_DEFAULT = 5
 
@@ -205,13 +205,13 @@ def _flags(client):
 # refusing, and climbs straight back (see cbcrypto's pacer). Premium accounts keep their own limits.
 TARGET_START_MIBS = 30.0   # downloads start here
 TARGET_MAX_MIBS = 50.0     # the highest rate the pacer will go to
-UPLOAD_START_MIBS = 28.0   # uploads start at what a bot is allowed from the first second, then climb toward TARGET_MAX_MIBS
+UPLOAD_START_MIBS = 32.0   # uploads start at what a bot is allowed from the first second, then climb toward TARGET_MAX_MIBS
 UPLOAD_BURST_MIB = 40.0    # fast start allowance; kept small because a bigger bank was flooded inside the first second
-UPLOAD_SUSTAIN_MIBS = 28.0  # what a bot can send continuously without FloodWait
+UPLOAD_SUSTAIN_MIBS = 32.0  # what a bot can send continuously without FloodWait
 TARGET_FLOOR_MIBS = 20.0   # a flood never cuts the rate below this
 BAND_GROWTH = 1.1    # ramp inside the band: +10% per quarter second, so a limit is met gently, not overshot
 UPLOAD_READ_TIMEOUT = 15.0  # a part that is not answered within this is requeued on a fresh connection (was 60 s of frozen speed)
-DOWNLOAD_POOL = 14   # parallel connections: one connection carries only a few MiB/s, so this sets the plateau
+DOWNLOAD_POOL = 15   # parallel connections: one connection carries only a few MiB/s, so this sets the plateau
 
 
 def _band(chunk: int):
