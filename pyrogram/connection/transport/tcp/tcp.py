@@ -264,9 +264,6 @@ class TCP:
 
         if family is None:
             family = socket.AF_INET6 if self.ipv6 else socket.AF_INET
-
-        log.info("Connecting to %s:%s", host, port)
-
         self.reader, self.writer = await asyncio.open_connection(
             host=host,
             port=port,
@@ -298,9 +295,6 @@ class TCP:
     async def _connect_via_socks_proxy(self, destination: tuple):
         dest_host, dest_port = destination
         proxy = await self._build_socks_proxy()
-
-        log.info("Connecting to %s:%s via proxy %s", dest_host, dest_port, self.proxy.hostname)
-
         sock = await proxy.connect(
             dest_host=dest_host,
             dest_port=dest_port,
@@ -389,9 +383,6 @@ class TCP:
         web_proxy: WebProxy = self.proxy
 
         bare_secret = self._obfuscated2_secret(web_proxy.secret)
-
-        log.info("Connecting to WEB proxy relay %s (dc_id=%s)", web_proxy.hostname, self.dc_id)
-
         carrier = WebProxyCarrier(web_proxy.hostname, secret=web_proxy.secret)
         self._web_carrier = carrier
 
