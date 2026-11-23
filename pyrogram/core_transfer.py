@@ -204,8 +204,10 @@ def _flags(client):
 # On a flood the pacer backs off gently, never below roughly half the band unless the server keeps
 # refusing, and climbs straight back (see cbcrypto's pacer). Premium accounts keep their own limits.
 TARGET_START_MIBS = 30.0   # downloads start here
-TARGET_MAX_MIBS = 40.0     # the highest rate the pacer will probe to
-UPLOAD_START_MIBS = 24.0   # uploads start here and climb to TARGET_MAX_MIBS while Telegram does not flood-wait
+TARGET_MAX_MIBS = 45.0     # the highest rate the pacer will go to
+UPLOAD_START_MIBS = 32.0   # uploads start here and climb toward TARGET_MAX_MIBS
+UPLOAD_BURST_MIB = 80.0    # Telegram lets a bot send fast for roughly this much, then only the sustained rate
+UPLOAD_SUSTAIN_MIBS = 22.0  # what a bot can send continuously without FloodWait (wzgram sits at 19-20)
 TARGET_FLOOR_MIBS = 20.0   # a flood never cuts the rate below this
 BAND_GROWTH = 1.1    # ramp inside the band: +10% per quarter second, so a limit is met gently, not overshot
 DOWNLOAD_POOL = 14   # parallel connections: one connection carries only a few MiB/s, so this sets the plateau
@@ -366,6 +368,7 @@ async def upload(client, path, progress, progress_args):
         ceiling = float(max(rate, 300))
         cap = float(env("CBGRAM_UPLOAD_SLOWSTART_CAP", 80))
         floor = 1.0
+        burst_credit = sustain = 0.0
     else:
         kind = "BOT" if is_bot else "USER"
         start, top = _band(PART_SIZE)
@@ -382,6 +385,8 @@ async def upload(client, path, progress, progress_args):
         cap = float(env("CBGRAM_UPLOAD_SLOWSTART_CAP", rate))  # = start rate: no exponential overshoot
         ceiling = float(max(rate, top))
         floor = _floor(PART_SIZE)
+        burst_credit = float(env("CBGRAM_UPLOAD_BURST_MIB", UPLOAD_BURST_MIB)) * (1024 * 1024) / PART_SIZE
+        sustain = float(env("CBGRAM_UPLOAD_SUSTAIN_MIBS", UPLOAD_SUSTAIN_MIBS)) * (1024 * 1024) / PART_SIZE
 
     with open(path, "rb") as fp:
         file_name = utils.get_file_name(fp, fallback="file.jpg")
@@ -421,6 +426,7 @@ async def upload(client, path, progress, progress_args):
         recv_buffer=_socket_buffer(),
         read_timeout=float(Session.MEDIA_WAIT_TIMEOUT),
         **({"floor": floor} if _accepts(cbcrypto.upload, "floor") else {}),
+        **({"burst_credit": burst_credit, "sustain": sustain} if _accepts(cbcrypto.upload, "burst_credit") else {}),
         **({"on_flood": _flood_log("upload.SaveBigFilePart" if is_big else "upload.SaveFilePart")} if _accepts(cbcrypto.upload, "on_flood") else {}),
     )
     rpc_type = raw.functions.upload.SaveBigFilePart if is_big else raw.functions.upload.SaveFilePart
