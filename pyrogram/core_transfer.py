@@ -108,8 +108,8 @@ class _Progress:
                 await self.loop.run_in_executor(self.client.executor, func)
         except pyrogram.StopTransmission as e:
             self.stop_exc = e
-        except Exception as e:
-            log.warning("Progress callback error: %s", e)
+        except Exception:
+            pass
 
     async def finish(self) -> None:
         if self._task is not None:
@@ -205,34 +205,13 @@ def _flags(client):
 # refusing, and climbs straight back (see cbcrypto's pacer). Premium accounts keep their own limits.
 TARGET_START_MIBS = 30.0   # downloads start here
 TARGET_MAX_MIBS = 45.0     # the highest rate the pacer will go to
-UPLOAD_START_MIBS = 32.0   # uploads start here and climb toward TARGET_MAX_MIBS
-UPLOAD_BURST_MIB = 80.0    # Telegram lets a bot send fast for roughly this much, then only the sustained rate
-UPLOAD_SUSTAIN_MIBS = 22.0  # what a bot can send continuously without FloodWait (wzgram sits at 19-20)
-TARGET_FLOOR_MIBS = 20.0   # a flood never cuts the rate below this
+UPLOAD_START_MIBS = 20.0   # uploads start at what a bot is allowed from the first second, then climb toward TARGET_MAX_MIBS
+UPLOAD_BURST_MIB = 40.0    # fast start allowance; kept small because a bigger bank was flooded inside the first second
+UPLOAD_SUSTAIN_MIBS = 20.0  # what a bot can send continuously without FloodWait
+TARGET_FLOOR_MIBS = 16.0   # a flood never cuts the rate below this
 BAND_GROWTH = 1.1    # ramp inside the band: +10% per quarter second, so a limit is met gently, not overshot
+UPLOAD_READ_TIMEOUT = 15.0  # a part that is not answered within this is requeued on a fresh connection (was 60 s of frozen speed)
 DOWNLOAD_POOL = 14   # parallel connections: one connection carries only a few MiB/s, so this sets the plateau
-
-
-def _log_transfer(kind: str, file_size: int, pool: int, workers: int, part: int, rate: float, ceiling: float) -> None:
-    """One line per transfer: what window and pace the engine was given, and whether the clock is sane.
-
-    The engine copies ``MsgId.time_offset`` at start. A wrong offset there makes every msg_id it sends
-    look hours old, so the server rejects them and the transfer crawls or restarts.
-    """
-    window_mib = pool * workers * part / (1024 * 1024)
-    log.info(
-        "%s: %.1f MiB, %d connections x %d in flight x %d KiB = %.1f MiB window "
-        "(max ~%.0f MiB/s at 0.5 s round trip), pace %.0f..%.0f req/s",
-        kind, file_size / (1024 * 1024), pool, workers, part // 1024, window_mib,
-        window_mib / 0.5, rate, ceiling,
-    )
-
-    if abs(MsgId.time_offset) > 30:
-        log.warning(
-            "%s starts with a clock offset of %.1fs: msg_ids will look wrong to Telegram and the "
-            "transfer will stall. Check for a stale clock sample (see MsgId.sync).",
-            kind, MsgId.time_offset,
-        )
 
 
 def _band(chunk: int):
@@ -246,6 +225,16 @@ def _band(chunk: int):
 def _floor(chunk: int) -> float:
     """Storm floor in requests/s for chunks of ``chunk`` bytes."""
     return float(os.environ.get("CBGRAM_TARGET_FLOOR", TARGET_FLOOR_MIBS)) * (1024 * 1024) / chunk
+
+
+def _upload_pool(file_size: int) -> int:
+    """Connections for an upload: few for small files (no ramp-up cost), the full pool for big ones."""
+    mib = file_size / (1024 * 1024)
+    if mib < 20:
+        return 6
+    if mib < 100:
+        return 12
+    return UPLOAD_POOL_DEFAULT
 
 
 def _download_chunk(file_size: int, pool: int) -> int:
@@ -325,8 +314,6 @@ async def download(client, file_id, file_size: int, file, progress, progress_arg
             **({"on_flood": _flood_log("upload.GetFile")} if _accepts(cbcrypto.download, "on_flood") else {}),
         )
 
-        _log_transfer("download", file_size, pool, workers, chunk, rate, ceiling)
-
         try:
             await _run_engine(tracker, call, raw.functions.upload.GetFile)
         except CdnRedirect:
@@ -381,7 +368,7 @@ async def upload(client, path, progress, progress_args):
         # window cannot raise the request rate, it only lets the paced rate be reached.
         workers = int(env(f"CBGRAM_UPLOAD_WORKERS_{kind}", UPLOAD_WORKERS_DEFAULT))
         rate = int(env(f"CBGRAM_UPLOAD_RATE_{kind}", round(start)))
-        pool = min(int(env(f"CBGRAM_UPLOAD_POOL_{kind}", UPLOAD_POOL_DEFAULT)), UPLOAD_POOL_MAX, pool_cap)
+        pool = min(int(env(f"CBGRAM_UPLOAD_POOL_{kind}", _upload_pool(file_size))), UPLOAD_POOL_MAX, pool_cap)
         cap = float(env("CBGRAM_UPLOAD_SLOWSTART_CAP", rate))  # = start rate: no exponential overshoot
         ceiling = float(max(rate, top))
         floor = _floor(PART_SIZE)
@@ -424,14 +411,12 @@ async def upload(client, path, progress, progress_args):
         slow_start_cap=cap,
         time_offset=float(MsgId.time_offset),
         recv_buffer=_socket_buffer(),
-        read_timeout=float(Session.MEDIA_WAIT_TIMEOUT),
+        read_timeout=float(env("CBGRAM_UPLOAD_READ_TIMEOUT", UPLOAD_READ_TIMEOUT)),
         **({"floor": floor} if _accepts(cbcrypto.upload, "floor") else {}),
         **({"burst_credit": burst_credit, "sustain": sustain} if _accepts(cbcrypto.upload, "burst_credit") else {}),
         **({"on_flood": _flood_log("upload.SaveBigFilePart" if is_big else "upload.SaveFilePart")} if _accepts(cbcrypto.upload, "on_flood") else {}),
     )
     rpc_type = raw.functions.upload.SaveBigFilePart if is_big else raw.functions.upload.SaveFilePart
-
-    _log_transfer("upload", file_size, pool, workers, PART_SIZE, rate, ceiling)
 
     try:
         await _run_engine(tracker, call, rpc_type)
