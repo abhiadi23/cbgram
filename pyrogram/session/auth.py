@@ -98,8 +98,6 @@ class Auth:
             )
 
             try:
-                log.info("Start creating a new auth key on DC%s", self.dc_id)
-
                 await self.connection.connect()
 
                 # Step 1; Step 2
@@ -293,8 +291,6 @@ class Auth:
                 server_salt = aes.xor(new_nonce[:8], server_nonce[:8])
 
                 log.debug("Server salt: %s", int.from_bytes(server_salt, "little"))
-
-                log.info("Done auth key exchange: %s", set_client_dh_params_answer.__class__.__name__)
             except Exception as e:
                 log.info("Retrying due to %s: %s", type(e).__name__, e)
 
