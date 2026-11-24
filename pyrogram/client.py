@@ -1579,7 +1579,11 @@ class Client(Methods):
         file_id, directory, file_name, in_memory, file_size, progress, progress_args = packet
 
         os.makedirs(directory, exist_ok=True) if not in_memory else None
-        temp_file_path = os.path.abspath(re.sub("\\\\", "/", os.path.join(directory, file_name))) + ".temp"
+        file_path = os.path.abspath(re.sub("\\\\", "/", os.path.join(directory, file_name)))
+        # Every download gets its own scratch file. A fixed "<name>.temp" is shared by any two downloads
+        # (or a retry racing the cleanup of its failed predecessor) that resolve to the same file name:
+        # one truncates/removes/moves the other's file, which surfaces as FileNotFoundError.
+        temp_file_path = f"{file_path}.{os.urandom(4).hex()}.temp"
         file = BytesIO() if in_memory else open(temp_file_path, "w+b")
         if not in_memory and file_size > 0:
             file.truncate(file_size)
@@ -1597,8 +1601,19 @@ class Client(Methods):
                     file.write(chunk)
         except BaseException as e:
             if not in_memory:
-                file.close()
-                os.remove(temp_file_path)
+                try:
+                    file.close()
+                except Exception:
+                    pass
+
+                # The scratch file may already be gone (download dir wiped by the caller's cleanup, etc.).
+                # That must never replace the real error (e.g. a connection reset) with FileNotFoundError.
+                try:
+                    os.remove(temp_file_path)
+                except FileNotFoundError:
+                    pass
+                except OSError as cleanup_error:
+                    log.warning("Could not remove %s: %s", temp_file_path, cleanup_error)
 
             if isinstance(e, pyrogram.StopTransmission):
                 return None
@@ -1610,7 +1625,7 @@ class Client(Methods):
                 return file
             else:
                 file.close()
-                file_path = os.path.splitext(temp_file_path)[0]
+                os.makedirs(os.path.dirname(file_path), exist_ok=True)  # recreated if it vanished mid-download
                 shutil.move(temp_file_path, file_path)
                 return file_path
 
