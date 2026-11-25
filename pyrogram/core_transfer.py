@@ -71,6 +71,7 @@ class _Progress:
         self.callback = callback
         self.args = args
         self.total = total
+        self.base = 0   # bytes already on disk when a transfer is resumed
         self.cancelled = threading.Event()
         self.stop_exc: Optional[BaseException] = None
         self._latest = 0
@@ -79,6 +80,7 @@ class _Progress:
 
     # runs in the engine thread
     def tick(self, done: int) -> None:
+        done += self.base
         if self.cancelled.is_set():
             raise _Cancelled()
         if self.stop_exc is not None:
@@ -211,7 +213,18 @@ UPLOAD_SUSTAIN_MIBS = 32.0  # what a bot can send continuously without FloodWait
 TARGET_FLOOR_MIBS = 20.0   # a flood never cuts the rate below this
 BAND_GROWTH = 1.1    # ramp inside the band: +10% per quarter second, so a limit is met gently, not overshot
 UPLOAD_READ_TIMEOUT = 15.0  # a part that is not answered within this is requeued on a fresh connection (was 60 s of frozen speed)
-DOWNLOAD_POOL = 15   # parallel connections: one connection carries only a few MiB/s, so this sets the plateau
+DOWNLOAD_POOL = 15   # parallel connections for ONE download
+DOWNLOAD_CONN_BUDGET = 60   # all downloads together (4 x 15): no cap in practice, lower it only if you must
+DOWNLOAD_MAX_RECONNECTS = 25   # consecutive failures per connection (engine default 5 gave up after ~7 s)
+DOWNLOAD_RETRIES = 6           # resumed retries after a reset; speed settings stay the same
+
+_dl_state = {"active": 0}
+
+
+def _conn_share() -> int:
+    """Connections this download may open: the global budget split over the downloads running now."""
+    budget = int(os.environ.get("CBGRAM_DL_CONN_BUDGET", DOWNLOAD_CONN_BUDGET))
+    return max(3, budget // max(1, _dl_state["active"]))
 
 
 def _band(chunk: int):
@@ -252,6 +265,26 @@ def _slow_start():
     return os.environ.get("CBGRAM_SLOW_START", "1") != "0"
 
 
+def _resume_point(path: str, file_size: int, chunk: int, floor_idx: int = 0) -> int:
+    """Byte offset of the first chunk that is still all zeros (not yet written), chunk aligned.
+
+    The file is pre-sized, so chunks the engine has not written read back as zeros. Chunks finish
+    nearly in order, so everything before the first hole is done and a resumed transfer only
+    re-fetches from there on (the few chunks past the hole that did arrive are fetched again)."""
+    try:
+        with open(path, "rb") as f:
+            idx = floor_idx
+            while idx * chunk < file_size:
+                f.seek(idx * chunk)
+                block = f.read(min(chunk, file_size - idx * chunk))
+                if not block or block.count(0) == len(block):
+                    break
+                idx += 1
+            return idx * chunk
+    except OSError:
+        return 0
+
+
 async def download(client, file_id, file_size: int, file, progress, progress_args) -> bool:
     """Download ``file_id`` into the open (pre-sized) local file. False = not handled, use Python."""
     path = getattr(file, "name", None)
@@ -275,6 +308,7 @@ async def download(client, file_id, file_size: int, file, progress, progress_arg
         else:
             kind = "BOT" if is_bot else "USER"
             pool, workers = int(env(f"CBGRAM_DL_POOL_{kind}", DOWNLOAD_POOL)), int(env(f"CBGRAM_DL_WORKERS_{kind}", DOWNLOAD_WORKERS_DEFAULT))
+            pool = min(pool, _conn_share())
             chunk = _download_chunk(file_size, pool)
             start, top = _band(chunk)
             rate = int(env(f"CBGRAM_DL_RATE_{kind}", round(start)))
@@ -283,43 +317,77 @@ async def download(client, file_id, file_size: int, file, progress, progress_arg
             ceiling = float(max(rate, cap))
             floor = _floor(chunk)
 
-        session, host, port = await _endpoint(client, dc_id)
-        tracker = _Progress(client, progress, progress_args, file_size)
-        prefix = raw.functions.upload.GetFile(location=location, offset=0, limit=0).write()[:-12]
-
-        call = functools.partial(
-            cbcrypto.download,
-            host=host,
-            port=port,
-            auth_key=bytes(session.auth_key),
-            auth_key_id=bytes(session.auth_key_id),
-            salt=session.salt,
-            init_prefix=await _init_prefix(client),
-            req_prefix=prefix,
-            path=path,
-            file_size=file_size,
-            chunk_size=chunk,
-            connections=max(1, min(pool, math.ceil(file_size / chunk))),
-            inflight=max(1, workers),
-            paced=is_bot or not is_premium,
-            rate=float(rate),
-            burst=float(burst),
-            ceiling=ceiling,
-            growth=float(env("CBGRAM_DL_GROWTH", 1.5 if is_premium and not is_bot else BAND_GROWTH)) if _slow_start() else 1.0,
-            slow_start_cap=cap,
-            time_offset=float(MsgId.time_offset),
-            recv_buffer=_socket_buffer(),
-            read_timeout=float(Session.MEDIA_WAIT_TIMEOUT),
-            **({"floor": floor} if _accepts(cbcrypto.download, "floor") else {}),
-            **({"on_flood": _flood_log("upload.GetFile")} if _accepts(cbcrypto.download, "on_flood") else {}),
-        )
-
+        _dl_state["active"] += 1
         try:
-            await _run_engine(tracker, call, raw.functions.upload.GetFile)
-        except CdnRedirect:
-            return False
-        await tracker.finish()
-        return True
+            session, host, port = await _endpoint(client, dc_id)
+            prefix = raw.functions.upload.GetFile(location=location, offset=0, limit=0).write()[:-12]
+            init_prefix = await _init_prefix(client)
+            max_reconnects = int(env("CBGRAM_DL_MAX_RECONNECTS", DOWNLOAD_MAX_RECONNECTS))
+            retries = int(env("CBGRAM_DL_RETRIES", DOWNLOAD_RETRIES))
+
+            resume_at = 0
+            for attempt in range(retries + 1):
+                # speed stays as configured; set CBGRAM_DL_RETRY_GENTLE=1 to halve it on every retry
+                gentle = 2 ** attempt if env("CBGRAM_DL_RETRY_GENTLE", "0") == "1" else 1
+                a_pool = max(2, pool // gentle)
+                a_rate = max(floor, float(rate) / gentle)
+                a_ceiling = max(a_rate, ceiling / gentle)
+                a_cap = max(a_rate, cap / gentle)
+                tracker = _Progress(client, progress, progress_args, file_size)
+                tracker.base = resume_at
+
+                call = functools.partial(
+                    cbcrypto.download,
+                    host=host,
+                    port=port,
+                    auth_key=bytes(session.auth_key),
+                    auth_key_id=bytes(session.auth_key_id),
+                    salt=session.salt,
+                    init_prefix=init_prefix,
+                    req_prefix=prefix,
+                    path=path,
+                    file_size=file_size,
+                    start_offset=resume_at,
+                    chunk_size=chunk,
+                    connections=max(1, min(a_pool, math.ceil((file_size - resume_at) / chunk))),
+                    inflight=max(1, workers),
+                    paced=is_bot or not is_premium,
+                    rate=a_rate,
+                    burst=float(burst),
+                    ceiling=a_ceiling,
+                    growth=float(env("CBGRAM_DL_GROWTH", 1.5 if is_premium and not is_bot else BAND_GROWTH)) if _slow_start() else 1.0,
+                    slow_start_cap=a_cap,
+                    time_offset=float(MsgId.time_offset),
+                    recv_buffer=_socket_buffer(),
+                    read_timeout=float(Session.MEDIA_WAIT_TIMEOUT),
+                    **({"max_reconnects": max_reconnects} if _accepts(cbcrypto.download, "max_reconnects") else {}),
+                    **({"floor": floor} if _accepts(cbcrypto.download, "floor") else {}),
+                    **({"on_flood": _flood_log("upload.GetFile")} if _accepts(cbcrypto.download, "on_flood") else {}),
+                )
+
+                try:
+                    await _run_engine(tracker, call, raw.functions.upload.GetFile)
+                except CdnRedirect:
+                    return False
+                except (OSError, TimeoutError) as e:
+                    # "Connection reset by peer" and friends: Telegram dropped us. Wait, then start the
+                    # file again, gentler. (Chunks land out of order, so there is no safe resume point.)
+                    if attempt >= retries:
+                        raise
+                    wait = min(2.0 * (attempt + 1), 10.0)
+                    resume_at = await asyncio.get_running_loop().run_in_executor(
+                        None, _resume_point, path, file_size, chunk, resume_at // chunk)
+                    log.warning("Download interrupted (%s); resuming at %.1f of %.1f MiB (retry %d/%d in %.0fs)",
+                                e, resume_at / 1048576, file_size / 1048576, attempt + 1, retries, wait)
+                    await asyncio.sleep(wait)
+                    if resume_at >= file_size:
+                        await tracker.finish()
+                        return True
+                    continue
+                await tracker.finish()
+                return True
+        finally:
+            _dl_state["active"] -= 1
 
 
 async def upload(client, path, progress, progress_args):
