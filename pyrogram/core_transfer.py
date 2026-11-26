@@ -17,6 +17,7 @@ import logging
 import math
 import os
 import threading
+import time
 from typing import Callable, Optional, Union
 
 import cbcrypto
@@ -213,15 +214,57 @@ UPLOAD_SUSTAIN_MIBS = 32.0  # what a bot can send continuously without FloodWait
 TARGET_FLOOR_MIBS = 20.0   # a flood never cuts the rate below this
 BAND_GROWTH = 1.1    # ramp inside the band: +10% per quarter second, so a limit is met gently, not overshot
 UPLOAD_READ_TIMEOUT = 15.0  # a part that is not answered within this is requeued on a fresh connection (was 60 s of frozen speed)
+DL_BURST_MIB = 40.0      # DOWNLOAD fast-start bank, same idea as UPLOAD_BURST_MIB
+DL_SUSTAIN_MIBS = 24.0   # DOWNLOAD steady rate the pacer starts from and then learns up/down (like UPLOAD_SUSTAIN_MIBS)
+DL_READ_TIMEOUT = 15.0   # a chunk not answered in this long is requeued on a fresh connection (was 60 s of frozen speed)
 DL_TARGET_START_MIBS = 24.0  # DOWNLOAD only: start rate (uploads keep TARGET_START_MIBS)
 DL_TARGET_MAX_MIBS = 40.0    # DOWNLOAD only: ceiling (uploads keep TARGET_MAX_MIBS)
-DL_TARGET_FLOOR_MIBS = 18.0  # DOWNLOAD only: a flood never cuts below this (keeps the average near 20+)
+DL_TARGET_FLOOR_MIBS = 12.0  # DOWNLOAD only: a flood never cuts below this (keeps the average near 20+)
 DOWNLOAD_POOL = 4    # parallel connections for ONE download (ferogram caps at 4: more and Telegram sheds them with a reset)
 DOWNLOAD_CONN_BUDGET = 12   # all downloads together (ferogram's global ceiling is 12)
 DOWNLOAD_MAX_RECONNECTS = 25   # consecutive failures per connection (engine default 5 gave up after ~7 s)
 DOWNLOAD_RETRIES = 6           # resumed retries after a reset; speed settings stay the same
 
 _dl_state = {"active": 0}
+_rtt_cache: dict = {}
+
+
+async def _measure_rtt(host: str, port: int) -> Optional[float]:
+    """Round-trip time to the DC in seconds (best of 2 TCP connects, cached 10 min), None if unknown."""
+    hit = _rtt_cache.get(host)
+    if hit and time.monotonic() - hit[1] < 600:
+        return hit[0]
+    best = None
+    for _ in range(2):
+        t0 = time.perf_counter()
+        try:
+            _, w = await asyncio.wait_for(asyncio.open_connection(host, port), 3.0)
+        except Exception:
+            continue
+        d = time.perf_counter() - t0
+        try:
+            w.close()
+        except Exception:
+            pass
+        best = d if best is None else min(best, d)
+    if best is not None:
+        _rtt_cache[host] = (best, time.monotonic())
+    return best
+
+
+def _adapt_to_distance(pool: int, workers: int, rtt: Optional[float]):
+    """A far server (Heroku US/EU -> a Singapore DC) gets less speed per TCP connection, because the
+    path is long and loss-based congestion control backs off. More connections and more requests in
+    flight make up for it. Near servers keep the small, safe numbers. Needs no config; CBGRAM_DL_ADAPTIVE=0
+    turns it off. A reset still halves everything on the retry, so a too-greedy guess corrects itself."""
+    env = os.environ.get
+    if rtt is None or env("CBGRAM_DL_ADAPTIVE", "1") != "1":
+        return pool, workers
+    if rtt > float(env("CBGRAM_DL_VFAR_RTT", 0.20)):
+        return max(pool, int(env("CBGRAM_DL_VFAR_POOL", 8))), max(workers, 5)
+    if rtt > float(env("CBGRAM_DL_FAR_RTT", 0.09)):
+        return max(pool, int(env("CBGRAM_DL_FAR_POOL", 6))), max(workers, 5)
+    return pool, workers
 
 
 def _conn_share() -> int:
@@ -313,10 +356,17 @@ async def download(client, file_id, file_size: int, file, progress, progress_arg
             ceiling = float(max(rate, 150))
             floor = 1.0
             cap = float(env("CBGRAM_DL_SLOWSTART_CAP", 40))
+            burst_credit = sustain = 0.0
         else:
             kind = "BOT" if is_bot else "USER"
             pool, workers = int(env(f"CBGRAM_DL_POOL_{kind}", DOWNLOAD_POOL)), int(env(f"CBGRAM_DL_WORKERS_{kind}", DOWNLOAD_WORKERS_DEFAULT))
-            pool = min(pool, _conn_share())
+            _, _h, _p = await _endpoint(client, dc_id)
+            rtt = await _measure_rtt(_h, _p)
+            pool, workers = _adapt_to_distance(pool, workers, rtt)
+            # far servers get double the shared connection budget (they need more sockets for the same speed)
+            pool = min(pool, _conn_share() * (2 if rtt and rtt > float(env("CBGRAM_DL_FAR_RTT", 0.09)) else 1))
+            log.info("Download from DC%s: RTT %s -> %d connections x %d in flight",
+                     dc_id, "unknown" if rtt is None else "%.0f ms" % (rtt * 1000), pool, workers)
             chunk = _download_chunk(file_size, pool)
             start, top = _band(chunk, download=True)
             rate = int(env(f"CBGRAM_DL_RATE_{kind}", round(start)))
@@ -324,6 +374,8 @@ async def download(client, file_id, file_size: int, file, progress, progress_arg
             cap = float(env("CBGRAM_DL_SLOWSTART_CAP", top))
             ceiling = float(max(rate, cap))
             floor = _floor(chunk, download=True)
+            burst_credit = float(env("CBGRAM_DL_BURST_MIB", DL_BURST_MIB)) * (1024 * 1024) / chunk
+            sustain = float(env("CBGRAM_DL_SUSTAIN_MIBS", DL_SUSTAIN_MIBS)) * (1024 * 1024) / chunk
 
         _dl_state["active"] += 1
         try:
@@ -341,6 +393,8 @@ async def download(client, file_id, file_size: int, file, progress, progress_arg
                 a_rate = max(floor, float(rate) / gentle)
                 a_ceiling = max(a_rate, ceiling / gentle)
                 a_cap = max(a_rate, cap / gentle)
+                a_credit = burst_credit / gentle
+                a_sustain = max(floor, sustain / gentle) if sustain else 0.0
                 tracker = _Progress(client, progress, progress_args, file_size)
                 tracker.base = resume_at
 
@@ -361,13 +415,15 @@ async def download(client, file_id, file_size: int, file, progress, progress_arg
                     inflight=max(1, workers),
                     paced=is_bot or not is_premium,
                     rate=a_rate,
-                    burst=float(burst),
+                    burst=float(max(burst, round(a_rate * 0.15))),  # small spike, like uploads
                     ceiling=a_ceiling,
+                    step=1.0,
                     growth=float(env("CBGRAM_DL_GROWTH", 1.5 if is_premium and not is_bot else BAND_GROWTH)) if _slow_start() else 1.0,
                     slow_start_cap=a_cap,
                     time_offset=float(MsgId.time_offset),
                     recv_buffer=_socket_buffer(),
-                    read_timeout=float(Session.MEDIA_WAIT_TIMEOUT),
+                    read_timeout=float(env("CBGRAM_DL_READ_TIMEOUT", DL_READ_TIMEOUT)),
+                    **({"burst_credit": a_credit, "sustain": a_sustain} if _accepts(cbcrypto.download, "burst_credit") else {}),
                     **({"max_reconnects": max_reconnects} if _accepts(cbcrypto.download, "max_reconnects") else {}),
                     **({"floor": floor} if _accepts(cbcrypto.download, "floor") else {}),
                     **({"on_flood": _flood_log("upload.GetFile")} if _accepts(cbcrypto.download, "on_flood") else {}),
