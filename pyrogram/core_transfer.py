@@ -35,7 +35,7 @@ PART_SIZE = 512 * 1024
 UPLOAD_POOL_MAX = 50
 UPLOAD_WORKERS_DEFAULT = 8
 UPLOAD_POOL_DEFAULT = 18
-DOWNLOAD_WORKERS_DEFAULT = 5
+DOWNLOAD_WORKERS_DEFAULT = 3   # requests in flight per connection (was 5; 15 x 5 = 75 MiB in the air got connections shed)
 
 def _flood_log(rpc_name: str):
     """The only log line of a transfer: Telegram asked us to wait, we retry after that many seconds."""
@@ -213,8 +213,11 @@ UPLOAD_SUSTAIN_MIBS = 32.0  # what a bot can send continuously without FloodWait
 TARGET_FLOOR_MIBS = 20.0   # a flood never cuts the rate below this
 BAND_GROWTH = 1.1    # ramp inside the band: +10% per quarter second, so a limit is met gently, not overshot
 UPLOAD_READ_TIMEOUT = 15.0  # a part that is not answered within this is requeued on a fresh connection (was 60 s of frozen speed)
-DOWNLOAD_POOL = 15   # parallel connections for ONE download
-DOWNLOAD_CONN_BUDGET = 60   # all downloads together (4 x 15): no cap in practice, lower it only if you must
+DL_TARGET_START_MIBS = 16.0  # DOWNLOAD only: start rate (uploads keep TARGET_START_MIBS)
+DL_TARGET_MAX_MIBS = 40.0    # DOWNLOAD only: ceiling (uploads keep TARGET_MAX_MIBS)
+DL_TARGET_FLOOR_MIBS = 6.0   # DOWNLOAD only: a flood never cuts below this
+DOWNLOAD_POOL = 4    # parallel connections for ONE download (ferogram caps at 4: more and Telegram sheds them with a reset)
+DOWNLOAD_CONN_BUDGET = 12   # all downloads together (ferogram's global ceiling is 12)
 DOWNLOAD_MAX_RECONNECTS = 25   # consecutive failures per connection (engine default 5 gave up after ~7 s)
 DOWNLOAD_RETRIES = 6           # resumed retries after a reset; speed settings stay the same
 
@@ -227,16 +230,21 @@ def _conn_share() -> int:
     return max(3, budget // max(1, _dl_state["active"]))
 
 
-def _band(chunk: int):
+def _band(chunk: int, download: bool = False):
     """(start, max) in requests/s for chunks of ``chunk`` bytes."""
     scale = (1024 * 1024) / chunk
     env = os.environ.get
+    if download:
+        return (float(env("CBGRAM_DL_TARGET_START", DL_TARGET_START_MIBS)) * scale,
+                float(env("CBGRAM_DL_TARGET_MAX", DL_TARGET_MAX_MIBS)) * scale)
     return (float(env("CBGRAM_TARGET_START", TARGET_START_MIBS)) * scale,
             float(env("CBGRAM_TARGET_MAX", TARGET_MAX_MIBS)) * scale)
 
 
-def _floor(chunk: int) -> float:
+def _floor(chunk: int, download: bool = False) -> float:
     """Storm floor in requests/s for chunks of ``chunk`` bytes."""
+    if download:
+        return float(os.environ.get("CBGRAM_DL_TARGET_FLOOR", DL_TARGET_FLOOR_MIBS)) * (1024 * 1024) / chunk
     return float(os.environ.get("CBGRAM_TARGET_FLOOR", TARGET_FLOOR_MIBS)) * (1024 * 1024) / chunk
 
 
@@ -310,12 +318,12 @@ async def download(client, file_id, file_size: int, file, progress, progress_arg
             pool, workers = int(env(f"CBGRAM_DL_POOL_{kind}", DOWNLOAD_POOL)), int(env(f"CBGRAM_DL_WORKERS_{kind}", DOWNLOAD_WORKERS_DEFAULT))
             pool = min(pool, _conn_share())
             chunk = _download_chunk(file_size, pool)
-            start, top = _band(chunk)
+            start, top = _band(chunk, download=True)
             rate = int(env(f"CBGRAM_DL_RATE_{kind}", round(start)))
             burst = int(env(f"CBGRAM_DL_BURST_{kind}", 8))
             cap = float(env("CBGRAM_DL_SLOWSTART_CAP", top))
             ceiling = float(max(rate, cap))
-            floor = _floor(chunk)
+            floor = _floor(chunk, download=True)
 
         _dl_state["active"] += 1
         try:
@@ -327,8 +335,8 @@ async def download(client, file_id, file_size: int, file, progress, progress_arg
 
             resume_at = 0
             for attempt in range(retries + 1):
-                # speed stays as configured; set CBGRAM_DL_RETRY_GENTLE=1 to halve it on every retry
-                gentle = 2 ** attempt if env("CBGRAM_DL_RETRY_GENTLE", "0") == "1" else 1
+                # each retry after a reset halves pool and rate (a reset means we were too aggressive); CBGRAM_DL_RETRY_GENTLE=0 keeps them
+                gentle = 2 ** attempt if env("CBGRAM_DL_RETRY_GENTLE", "1") == "1" else 1
                 a_pool = max(2, pool // gentle)
                 a_rate = max(floor, float(rate) / gentle)
                 a_ceiling = max(a_rate, ceiling / gentle)
