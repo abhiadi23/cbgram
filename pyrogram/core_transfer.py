@@ -35,7 +35,7 @@ PART_SIZE = 512 * 1024
 UPLOAD_POOL_MAX = 50
 UPLOAD_WORKERS_DEFAULT = 8
 UPLOAD_POOL_DEFAULT = 18
-DOWNLOAD_WORKERS_DEFAULT = 3   # requests in flight per connection (was 5; 15 x 5 = 75 MiB in the air got connections shed)
+DOWNLOAD_WORKERS_DEFAULT = 4   # requests in flight per connection (4 x 4 = 16 MiB in the air; was 15 x 5 = 75, which got connections shed)
 
 def _flood_log(rpc_name: str):
     """The only log line of a transfer: Telegram asked us to wait, we retry after that many seconds."""
@@ -213,9 +213,9 @@ UPLOAD_SUSTAIN_MIBS = 32.0  # what a bot can send continuously without FloodWait
 TARGET_FLOOR_MIBS = 20.0   # a flood never cuts the rate below this
 BAND_GROWTH = 1.1    # ramp inside the band: +10% per quarter second, so a limit is met gently, not overshot
 UPLOAD_READ_TIMEOUT = 15.0  # a part that is not answered within this is requeued on a fresh connection (was 60 s of frozen speed)
-DL_TARGET_START_MIBS = 16.0  # DOWNLOAD only: start rate (uploads keep TARGET_START_MIBS)
+DL_TARGET_START_MIBS = 24.0  # DOWNLOAD only: start rate (uploads keep TARGET_START_MIBS)
 DL_TARGET_MAX_MIBS = 40.0    # DOWNLOAD only: ceiling (uploads keep TARGET_MAX_MIBS)
-DL_TARGET_FLOOR_MIBS = 6.0   # DOWNLOAD only: a flood never cuts below this
+DL_TARGET_FLOOR_MIBS = 18.0  # DOWNLOAD only: a flood never cuts below this (keeps the average near 20+)
 DOWNLOAD_POOL = 4    # parallel connections for ONE download (ferogram caps at 4: more and Telegram sheds them with a reset)
 DOWNLOAD_CONN_BUDGET = 12   # all downloads together (ferogram's global ceiling is 12)
 DOWNLOAD_MAX_RECONNECTS = 25   # consecutive failures per connection (engine default 5 gave up after ~7 s)
