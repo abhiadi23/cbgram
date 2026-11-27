@@ -217,11 +217,11 @@ UPLOAD_READ_TIMEOUT = 15.0  # a part that is not answered within this is requeue
 DL_BURST_MIB = 40.0      # DOWNLOAD fast-start bank, same idea as UPLOAD_BURST_MIB
 DL_SUSTAIN_MIBS = 24.0   # DOWNLOAD steady rate the pacer starts from and then learns up/down (like UPLOAD_SUSTAIN_MIBS)
 DL_READ_TIMEOUT = 15.0   # a chunk not answered in this long is requeued on a fresh connection (was 60 s of frozen speed)
-DL_TARGET_START_MIBS = 24.0  # DOWNLOAD only: start rate (uploads keep TARGET_START_MIBS)
-DL_TARGET_MAX_MIBS = 50.0    # DOWNLOAD only: ceiling (uploads keep TARGET_MAX_MIBS); pacer backs off on FloodWait
-DL_TARGET_FLOOR_MIBS = 18.0  # DOWNLOAD only: a flood never cuts below this (keeps the average near 20+)
-DOWNLOAD_POOL = 4    # parallel connections for ONE download (ferogram caps at 4: more and Telegram sheds them with a reset)
-DOWNLOAD_CONN_BUDGET = 12   # all downloads together (ferogram's global ceiling is 12)
+DL_TARGET_START_MIBS = 25.0  # DOWNLOAD only: start rate (uploads keep TARGET_START_MIBS)
+DL_TARGET_MAX_MIBS = 60.0    # DOWNLOAD only: ceiling (uploads keep TARGET_MAX_MIBS); pacer backs off on FloodWait
+DL_TARGET_FLOOR_MIBS = 20.0  # DOWNLOAD only: a flood never cuts below this (keeps the average near 20+)
+DOWNLOAD_POOL = 4    # parallel connections for ONE download caps at 4: more and Telegram sheds them with a reset)
+DOWNLOAD_CONN_BUDGET = 12   # all downloads together global ceiling is 12)
 DOWNLOAD_MAX_RECONNECTS = 25   # consecutive failures per connection (engine default 5 gave up after ~7 s)
 DOWNLOAD_RETRIES = 6           # resumed retries after a reset; speed settings stay the same
 
