@@ -215,11 +215,11 @@ TARGET_FLOOR_MIBS = 20.0   # a flood never cuts the rate below this
 BAND_GROWTH = 1.1    # ramp inside the band: +10% per quarter second, so a limit is met gently, not overshot
 UPLOAD_READ_TIMEOUT = 15.0  # a part that is not answered within this is requeued on a fresh connection (was 60 s of frozen speed)
 DL_BURST_MIB = 40.0      # DOWNLOAD fast-start bank, same idea as UPLOAD_BURST_MIB
-DL_SUSTAIN_MIBS = 24.0   # DOWNLOAD steady rate the pacer starts from and then learns up/down (like UPLOAD_SUSTAIN_MIBS)
+DL_SUSTAIN_MIBS = 26.0   # DOWNLOAD steady rate the pacer starts from and then learns up/down (like UPLOAD_SUSTAIN_MIBS)
 DL_READ_TIMEOUT = 15.0   # a chunk not answered in this long is requeued on a fresh connection (was 60 s of frozen speed)
-DL_TARGET_START_MIBS = 24.0  # DOWNLOAD only: start rate (uploads keep TARGET_START_MIBS)
+DL_TARGET_START_MIBS = 26.0  # DOWNLOAD only: start rate (uploads keep TARGET_START_MIBS)
 DL_TARGET_MAX_MIBS = 50.0    # DOWNLOAD only: ceiling (uploads keep TARGET_MAX_MIBS); pacer backs off on FloodWait
-DL_TARGET_FLOOR_MIBS = 18.0  # DOWNLOAD only: a flood never cuts below this (keeps the average near 20+)
+DL_TARGET_FLOOR_MIBS = 20.0  # DOWNLOAD only: a flood never cuts below this (keeps the average near 20+)
 DOWNLOAD_POOL = 4    # parallel connections for ONE download (ferogram caps at 4: more and Telegram sheds them with a reset)
 DOWNLOAD_CONN_BUDGET = 12   # all downloads together (ferogram's global ceiling is 12)
 DOWNLOAD_MAX_RECONNECTS = 25   # consecutive failures per connection (engine default 5 gave up after ~7 s)
@@ -573,3 +573,158 @@ def _md5_of_file(path: str) -> str:
         for block in iter(lambda: f.read(4 * 1024 * 1024), b""):
             h.update(block)
     return h.hexdigest()
+
+
+# ---------------------------------------------------------------------------------------------
+# streaming: the same Rust engine, but the reader gets the bytes while they arrive
+# ---------------------------------------------------------------------------------------------
+
+STREAM_CHUNK = 1024 * 1024
+
+
+def stream_supported(client) -> bool:
+    """True if the Rust core can stream (needs cbcrypto >= 0.6.0 and no proxy)."""
+    return enabled(client) and hasattr(cbcrypto, "StreamCtl")
+
+
+def stream_chunk() -> int:
+    """Chunk size of a stream. Telegram accepts any size that divides 1 MiB and is a multiple of 4 KiB."""
+    c = int(os.environ.get("CBGRAM_STREAM_CHUNK", STREAM_CHUNK))
+    if c < 4096 or c % 4096 or (1024 * 1024) % c:
+        return STREAM_CHUNK
+    return c
+
+
+async def stream_download(client, file_id, file_size: int, path: Optional[str], start_offset: int, ctl, notify: Callable[[], None]) -> bool:
+    """Run ONE engine job that writes ``file_id`` into the pre-sized file ``path`` from ``start_offset`` on.
+
+    ``ctl`` is a ``cbcrypto.StreamCtl``: the reader moves ``ctl.consumed()`` forward and reads
+    ``ctl.watermark()`` (everything below it is on disk). The engine never runs more than the ctl's
+    window ahead of the reader, so an idle or paused player costs no bandwidth. ``notify`` is called
+    (from the engine thread) whenever new bytes landed. Returns False for a CDN file (use Python).
+    Returns when the file is complete, or quietly when ``ctl.cancel()`` was called.
+    """
+    chunk = stream_chunk()
+    path = path or os.devnull                           # in-memory streams (StreamCtl(memory=True)) write no file
+    if start_offset % chunk or start_offset >= file_size:
+        raise ValueError("start_offset must be chunk aligned and inside the file")
+
+    dc_id = file_id.dc_id
+    is_bot, is_premium = _flags(client)
+    env = os.environ.get
+    kind = "BOT" if is_bot else "USER"
+
+    if is_premium and not is_bot:
+        pool, workers = int(env("CBGRAM_DL_POOL_PREMIUM", 6)), int(env("CBGRAM_DL_WORKERS_PREMIUM", 4))
+        rate, burst = int(env("CBGRAM_DL_RATE_PREMIUM", 150)), int(env("CBGRAM_DL_BURST_PREMIUM", 35))
+        ceiling, floor = float(max(rate, 150)), 1.0
+        cap = float(env("CBGRAM_DL_SLOWSTART_CAP", 40))
+        burst_credit = sustain = 0.0
+    else:
+        pool, workers = int(env(f"CBGRAM_DL_POOL_{kind}", DOWNLOAD_POOL)), int(env(f"CBGRAM_DL_WORKERS_{kind}", DOWNLOAD_WORKERS_DEFAULT))
+        _, _h, _p = await _endpoint(client, dc_id)
+        rtt = await _measure_rtt(_h, _p)
+        pool, workers = _adapt_to_distance(pool, workers, rtt)
+        pool = min(pool, _conn_share() * (2 if rtt and rtt > float(env("CBGRAM_DL_FAR_RTT", 0.09)) else 1))
+        start, top = _band(chunk, download=True)
+        rate = int(env(f"CBGRAM_DL_RATE_{kind}", round(start)))
+        burst = int(env(f"CBGRAM_DL_BURST_{kind}", 8))
+        cap = float(env("CBGRAM_DL_SLOWSTART_CAP", top))
+        ceiling = float(max(rate, cap))
+        floor = _floor(chunk, download=True)
+        burst_credit = float(env("CBGRAM_DL_BURST_MIB", DL_BURST_MIB)) * (1024 * 1024) / chunk
+        sustain = float(env("CBGRAM_DL_SUSTAIN_MIBS", DL_SUSTAIN_MIBS)) * (1024 * 1024) / chunk
+
+    location = client._file_location(file_id)
+    loop = asyncio.get_running_loop()
+    pending = threading.Event()
+
+    def wake() -> None:
+        pending.clear()
+        notify()
+
+    def tick(_done: int) -> None:      # engine thread, only called when new bytes landed
+        if not pending.is_set():
+            pending.set()
+            loop.call_soon_threadsafe(wake)
+
+    if env("CBGRAM_STREAM_POOL"):                       # many small streams: few sockets each
+        pool = max(1, min(pool, int(env("CBGRAM_STREAM_POOL"))))
+
+    _dl_state["active"] += 1
+    try:
+        session, host, port = await _endpoint(client, dc_id)
+        prefix = raw.functions.upload.GetFile(location=location, offset=0, limit=0).write()[:-12]
+        init_prefix = await _init_prefix(client)
+        max_reconnects = int(env("CBGRAM_DL_MAX_RECONNECTS", DOWNLOAD_MAX_RECONNECTS))
+        retries = int(env("CBGRAM_DL_RETRIES", DOWNLOAD_RETRIES))
+
+        resume_at = start_offset
+        for attempt in range(retries + 1):
+            gentle = 2 ** attempt if env("CBGRAM_DL_RETRY_GENTLE", "1") == "1" else 1
+            a_pool = max(2, pool // gentle)
+            a_rate = max(floor, float(rate) / gentle)
+            call = functools.partial(
+                cbcrypto.download,
+                host=host,
+                port=port,
+                auth_key=bytes(session.auth_key),
+                auth_key_id=bytes(session.auth_key_id),
+                salt=session.salt,
+                init_prefix=init_prefix,
+                req_prefix=prefix,
+                path=path,
+                file_size=file_size,
+                start_offset=resume_at,
+                chunk_size=chunk,
+                connections=max(1, min(a_pool, math.ceil((file_size - resume_at) / chunk))),
+                inflight=max(1, workers),
+                paced=is_bot or not is_premium,
+                rate=a_rate,
+                burst=float(max(burst, round(a_rate * 0.15))),
+                ceiling=max(a_rate, ceiling / gentle),
+                step=1.0,
+                growth=float(env("CBGRAM_DL_GROWTH", 1.5 if is_premium and not is_bot else BAND_GROWTH)) if _slow_start() else 1.0,
+                slow_start_cap=max(a_rate, cap / gentle),
+                time_offset=float(MsgId.time_offset),
+                recv_buffer=_socket_buffer(),
+                read_timeout=float(env("CBGRAM_DL_READ_TIMEOUT", DL_READ_TIMEOUT)),
+                max_reconnects=max_reconnects,
+                floor=floor,
+                burst_credit=burst_credit / gentle,
+                sustain=max(floor, sustain / gentle) if sustain else 0.0,
+                on_flood=_flood_log("upload.GetFile"),
+                progress=tick,
+                stream=ctl,
+            )
+            fut = loop.run_in_executor(None, call)
+            try:
+                await asyncio.shield(fut)
+                return True
+            except asyncio.CancelledError:
+                ctl.cancel()
+                try:
+                    await fut
+                except BaseException:
+                    pass
+                raise
+            except cbcrypto.CoreError as e:
+                kind_, _code, _msg = e.args[:3]
+                if kind_ == "cancelled":
+                    return True
+                if kind_ == "cdn":
+                    return False
+                if kind_ in ("io", "timeout", "protocol") and attempt < retries:
+                    # Telegram dropped us: wait, then continue from the contiguous watermark, gentler
+                    resume_at = min(file_size - 1, (ctl.watermark() // chunk) * chunk)
+                    wait = min(2.0 * (attempt + 1), 10.0)
+                    log.warning("Stream interrupted (%s: %s); resuming at %.1f MiB (retry %d/%d in %.0fs)",
+                                kind_, _msg, resume_at / 1048576, attempt + 1, retries, wait)
+                    await asyncio.sleep(wait)
+                    if ctl.watermark() >= file_size:
+                        return True
+                    continue
+                _raise_core_error(e, raw.functions.upload.GetFile)
+        return True
+    finally:
+        _dl_state["active"] -= 1
