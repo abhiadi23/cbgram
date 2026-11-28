@@ -215,18 +215,37 @@ TARGET_FLOOR_MIBS = 20.0   # a flood never cuts the rate below this
 BAND_GROWTH = 1.1    # ramp inside the band: +10% per quarter second, so a limit is met gently, not overshot
 UPLOAD_READ_TIMEOUT = 15.0  # a part that is not answered within this is requeued on a fresh connection (was 60 s of frozen speed)
 DL_BURST_MIB = 0.0      # DOWNLOAD fast-start bank, same idea as UPLOAD_BURST_MIB
-DL_SUSTAIN_MIBS = 16.0   # DOWNLOAD steady rate the pacer starts from and then learns up/down (like UPLOAD_SUSTAIN_MIBS)
+DL_SUSTAIN_MIBS = 24.0   # DOWNLOAD steady rate the pacer starts from and then learns up/down (like UPLOAD_SUSTAIN_MIBS)
 DL_READ_TIMEOUT = 15.0   # a chunk not answered in this long is requeued on a fresh connection (was 60 s of frozen speed)
-DL_TARGET_START_MIBS = 16.0  # DOWNLOAD only: start rate (uploads keep TARGET_START_MIBS)
-DL_TARGET_MAX_MIBS = 36.0    # DOWNLOAD only: ceiling (uploads keep TARGET_MAX_MIBS); pacer backs off on FloodWait
-DL_TARGET_FLOOR_MIBS = 8.0   # DOWNLOAD only: a flood never cuts the rate below this
+DL_TARGET_START_MIBS = 20.0  # DOWNLOAD only: start rate (uploads keep TARGET_START_MIBS)
+DL_TARGET_MAX_MIBS = 48.0    # DOWNLOAD only: ceiling (uploads keep TARGET_MAX_MIBS); pacer backs off on FloodWait
+DL_TARGET_FLOOR_MIBS = 10.0  # DOWNLOAD only: a flood never cuts the rate below this
 DOWNLOAD_POOL = 4    # parallel connections for ONE download (more and Telegram answers with resets)
-DOWNLOAD_CONN_BUDGET = 12   # connections for all downloads together
+DOWNLOAD_CONN_BUDGET = 12   # per-(client, DC) connection budget so multi-bot pools do not choke each other
 DOWNLOAD_MAX_RECONNECTS = 25   # consecutive failures per connection (engine default 5 gave up after ~7 s)
 DOWNLOAD_RETRIES = 6           # resumed retries after a reset; speed settings stay the same
 
 _dl_state = {"active": 0}
+_dl_active: dict = {}
 _rtt_cache: dict = {}
+
+
+def _dl_scope(client, dc_id: int) -> tuple:
+    return (getattr(client, "name", None) or id(client), dc_id)
+
+
+def _dl_enter(scope: tuple) -> None:
+    _dl_state["active"] += 1
+    _dl_active[scope] = _dl_active.get(scope, 0) + 1
+
+
+def _dl_exit(scope: tuple) -> None:
+    _dl_state["active"] = max(0, _dl_state["active"] - 1)
+    left = _dl_active.get(scope, 0) - 1
+    if left > 0:
+        _dl_active[scope] = left
+    else:
+        _dl_active.pop(scope, None)
 
 
 async def _measure_rtt(host: str, port: int) -> Optional[float]:
@@ -258,7 +277,7 @@ def _adapt_to_distance(pool: int, workers: int, rtt: Optional[float]):
     flight make up for it. Near servers keep the small, safe numbers. Needs no config; CBGRAM_DL_ADAPTIVE=0
     turns it off. A reset still halves everything on the retry, so a too-greedy guess corrects itself."""
     env = os.environ.get
-    if rtt is None or env("CBGRAM_DL_ADAPTIVE", "0") != "1":
+    if rtt is None or env("CBGRAM_DL_ADAPTIVE", "1") != "1":
         return pool, workers
     if rtt > float(env("CBGRAM_DL_VFAR_RTT", 0.20)):
         return max(pool, int(env("CBGRAM_DL_VFAR_POOL", 8))), max(workers, 5)
@@ -267,26 +286,24 @@ def _adapt_to_distance(pool: int, workers: int, rtt: Optional[float]):
     return pool, workers
 
 
-def _conn_share() -> int:
-    """Connections this download may open: the global budget split over the downloads running now.
+def _conn_share(scope: Optional[tuple] = None) -> int:
+    """Connections this download may open: the per-(client, DC) budget split over active downloads.
 
-    Called BEFORE this download registers itself in ``_dl_state["active"]``, so it counts itself
-    here (+1). The old ``max(3, ...)`` floor let N downloads open 3 x N sockets no matter the
-    budget (16 downloads = 48 connections, which Telegram answers with resets); the floor is now 1
-    and the number of parallel downloads is capped at the client (``get_file_semaphore``), so the
-    budget actually holds.
+    Called BEFORE this download registers itself in ``_dl_active``, so it counts itself
+    here (+1). Using a per-(client, DC) scope prevents multi-bot pools from choking on a single
+    global 12-connection cap while still staying inside Telegram's per-bot DC limit.
     """
     budget = int(os.environ.get("CBGRAM_DL_CONN_BUDGET", DOWNLOAD_CONN_BUDGET))
-    return max(1, budget // (_dl_state["active"] + 1))
+    active = _dl_active.get(scope, 0) if scope is not None else _dl_state["active"]
+    return max(1, budget // (active + 1))
 
 
 def _far_bonus(rtt: Optional[float]) -> int:
-    """Multiplier on the shared budget for far DCs. Default 1 (off): the budget is a hard ceiling,
-    and doubling it is what pushed the total past what Telegram tolerates. Opt in with
-    CBGRAM_DL_FAR_BONUS=2 if a single download on a far DC is too slow."""
+    """Multiplier on the shared budget for far DCs (default 2 for cross-DC RTT > 90ms).
+    Set CBGRAM_DL_FAR_BONUS=1 to disable."""
     env = os.environ.get
     if rtt and rtt > float(env("CBGRAM_DL_FAR_RTT", 0.09)):
-        return max(1, int(env("CBGRAM_DL_FAR_BONUS", 1)))
+        return max(1, int(env("CBGRAM_DL_FAR_BONUS", 2)))
     return 1
 
 
@@ -367,6 +384,7 @@ async def download(client, file_id, file_size: int, file, progress, progress_arg
         env = os.environ.get
         rtt = None  # only measured on the non-premium path
 
+        scope = _dl_scope(client, dc_id)
         if is_premium and not is_bot:
             pool, workers = int(env("CBGRAM_DL_POOL_PREMIUM", 6)), int(env("CBGRAM_DL_WORKERS_PREMIUM", 4))
             chunk = CHUNK_SIZE
@@ -382,7 +400,7 @@ async def download(client, file_id, file_size: int, file, progress, progress_arg
             rtt = await _measure_rtt(_h, _p)
             pool, workers = _adapt_to_distance(pool, workers, rtt)
             # far servers get double the shared connection budget (they need more sockets for the same speed)
-            pool = max(1, min(pool, _conn_share() * _far_bonus(rtt)))
+            pool = max(1, min(pool, _conn_share(scope) * _far_bonus(rtt)))
             log.info("Download from DC%s: RTT %s -> %d connections x %d in flight",
                      dc_id, "unknown" if rtt is None else "%.0f ms" % (rtt * 1000), pool, workers)
             chunk = _download_chunk(file_size, pool)
@@ -395,7 +413,7 @@ async def download(client, file_id, file_size: int, file, progress, progress_arg
             burst_credit = float(env("CBGRAM_DL_BURST_MIB", DL_BURST_MIB)) * (1024 * 1024) / chunk
             sustain = float(env("CBGRAM_DL_SUSTAIN_MIBS", DL_SUSTAIN_MIBS)) * (1024 * 1024) / chunk
 
-        _dl_state["active"] += 1
+        _dl_enter(scope)
         try:
             session, host, port = await _endpoint(client, dc_id)
             prefix = raw.functions.upload.GetFile(location=location, offset=0, limit=0).write()[:-12]
@@ -405,8 +423,8 @@ async def download(client, file_id, file_size: int, file, progress, progress_arg
 
             resume_at = 0
             for attempt in range(retries + 1):
-                # each retry after a reset halves pool and rate (a reset means we were too aggressive); CBGRAM_DL_RETRY_GENTLE=0 keeps them
-                gentle = 2 ** attempt if env("CBGRAM_DL_RETRY_GENTLE", "1") == "1" else 1
+                # Cap retry step-back at 2x so transient resets do not crush sustained speed.
+                gentle = min(2, 2 ** attempt) if env("CBGRAM_DL_RETRY_GENTLE", "1") == "1" else 1
                 a_pool = max(2, pool // gentle)
                 a_rate = max(floor, float(rate) / gentle)
                 a_ceiling = max(a_rate, ceiling / gentle)
@@ -485,7 +503,7 @@ async def download(client, file_id, file_size: int, file, progress, progress_arg
                             round(stats["pace_end"]) if "pace_end" in stats else "?")
                 return True
         finally:
-            _dl_state["active"] -= 1
+            _dl_exit(scope)
 
 
 async def upload(client, path, progress, progress_args):
@@ -629,7 +647,7 @@ def stream_chunk() -> int:
     return c
 
 
-async def stream_download(client, file_id, file_size: int, path: Optional[str], start_offset: int, ctl, notify: Callable[[], None]) -> bool:
+async def stream_download(client, file_id, file_size: int, path: Optional[str], start_offset: int, ctl, notify: Callable[[], None], end_offset: Optional[int] = None) -> bool:
     """Run ONE engine job that writes ``file_id`` into the pre-sized file ``path`` from ``start_offset`` on.
 
     ``ctl`` is a ``cbcrypto.StreamCtl``: the reader moves ``ctl.consumed()`` forward and reads
@@ -644,9 +662,11 @@ async def stream_download(client, file_id, file_size: int, path: Optional[str], 
         raise ValueError("start_offset must be chunk aligned and inside the file")
 
     dc_id = file_id.dc_id
+    scope = _dl_scope(client, dc_id)
     is_bot, is_premium = _flags(client)
     env = os.environ.get
     kind = "BOT" if is_bot else "USER"
+    target_end = min(file_size, end_offset + 1) if end_offset is not None and end_offset >= start_offset else file_size
 
     if is_premium and not is_bot:
         pool, workers = int(env("CBGRAM_DL_POOL_PREMIUM", 6)), int(env("CBGRAM_DL_WORKERS_PREMIUM", 4))
@@ -659,7 +679,7 @@ async def stream_download(client, file_id, file_size: int, path: Optional[str], 
         _, _h, _p = await _endpoint(client, dc_id)
         rtt = await _measure_rtt(_h, _p)
         pool, workers = _adapt_to_distance(pool, workers, rtt)
-        pool = max(1, min(pool, _conn_share() * _far_bonus(rtt)))
+        pool = max(1, min(pool, _conn_share(scope) * _far_bonus(rtt)))
         start, top = _band(chunk, download=True)
         rate = int(env(f"CBGRAM_DL_RATE_{kind}", round(start)))
         burst = int(env(f"CBGRAM_DL_BURST_{kind}", 2))
@@ -678,6 +698,8 @@ async def stream_download(client, file_id, file_size: int, path: Optional[str], 
         notify()
 
     def tick(_done: int) -> None:      # engine thread, only called when new bytes landed
+        if target_end < file_size and ctl.watermark() >= target_end:
+            ctl.cancel()
         if not pending.is_set():
             pending.set()
             loop.call_soon_threadsafe(wake)
@@ -685,7 +707,7 @@ async def stream_download(client, file_id, file_size: int, path: Optional[str], 
     if env("CBGRAM_STREAM_POOL"):                       # many small streams: few sockets each
         pool = max(1, min(pool, int(env("CBGRAM_STREAM_POOL"))))
 
-    _dl_state["active"] += 1
+    _dl_enter(scope)
     try:
         session, host, port = await _endpoint(client, dc_id)
         prefix = raw.functions.upload.GetFile(location=location, offset=0, limit=0).write()[:-12]
@@ -695,7 +717,7 @@ async def stream_download(client, file_id, file_size: int, path: Optional[str], 
 
         resume_at = start_offset
         for attempt in range(retries + 1):
-            gentle = 2 ** attempt if env("CBGRAM_DL_RETRY_GENTLE", "1") == "1" else 1
+            gentle = min(2, 2 ** attempt) if env("CBGRAM_DL_RETRY_GENTLE", "1") == "1" else 1
             a_pool = max(2, pool // gentle)
             a_rate = max(floor, float(rate) / gentle)
             call = functools.partial(
@@ -711,7 +733,7 @@ async def stream_download(client, file_id, file_size: int, path: Optional[str], 
                 file_size=file_size,
                 start_offset=resume_at,
                 chunk_size=chunk,
-                connections=max(1, min(a_pool, math.ceil((file_size - resume_at) / chunk))),
+                connections=max(1, min(a_pool, math.ceil((target_end - resume_at) / chunk))),
                 inflight=max(1, workers),
                 paced=is_bot or not is_premium,
                 rate=a_rate,
@@ -755,10 +777,10 @@ async def stream_download(client, file_id, file_size: int, path: Optional[str], 
                     log.warning("Stream interrupted (%s: %s); resuming at %.1f MiB (retry %d/%d in %.0fs)",
                                 kind_, _msg, resume_at / 1048576, attempt + 1, retries, wait)
                     await asyncio.sleep(wait)
-                    if ctl.watermark() >= file_size:
+                    if ctl.watermark() >= target_end:
                         return True
                     continue
                 _raise_core_error(e, raw.functions.upload.GetFile)
         return True
     finally:
-        _dl_state["active"] -= 1
+        _dl_exit(scope)

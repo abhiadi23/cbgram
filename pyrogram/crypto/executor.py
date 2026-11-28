@@ -11,7 +11,8 @@ def _default_crypto_workers() -> int:
         except ValueError:
             pass
 
-    return min(4, max(2, os.cpu_count() or 1))
+    # Scale thread workers so concurrent 1 MiB chunk decrypts do not queue on 1-2 vCPU hosts.
+    return min(8, max(4, (os.cpu_count() or 2) * 2))
 
 
 _crypto_pool = None

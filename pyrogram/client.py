@@ -524,9 +524,9 @@ class Client(Methods):
     DOWNLOAD_POOL_SIZE = 4  # fallback default
     MEDIA_POOL_CAP = 16
     MAX_CONCURRENT_TRANSMISSIONS = 16
-    # Parallel DOWNLOADS are capped lower than uploads: each one opens up to 4 sockets and
-    # Telegram resets everything past ~12 connections in total. 3 x 4 = 12.
-    MAX_CONCURRENT_DOWNLOADS = 3
+    # Allow 16 concurrent downloads per client (override with CBGRAM_DL_PARALLEL)
+    # so rush-hour traffic across clients is not bottlenecked at 3.
+    MAX_CONCURRENT_DOWNLOADS = 16
     MAX_MESSAGE_CACHE_SIZE = 1000
     MAX_TOPIC_CACHE_SIZE = 1000
     MAX_BUSINESS_CONNECTIONS = 512
@@ -1637,6 +1637,98 @@ class Client(Methods):
 
     _file_location = staticmethod(lambda file_id: _file_location(file_id))
 
+    async def stream_chunks(
+        self,
+        file_id: FileId,
+        file_size: int = 0,
+        limit: int = 0,
+        offset: int = 0,
+        mem_window_mib: float = 4.0,
+    ) -> AsyncGenerator[bytes, None]:
+        """Yield 1 MiB chunks using the Rust memory-mode engine when available, else Python ``get_file``."""
+        from pyrogram import core_transfer
+
+        chunk = core_transfer.stream_chunk()
+        start_offset = abs(offset) * chunk
+
+        if (
+            core_transfer.stream_supported(self)
+            and file_size > 0
+            and start_offset < file_size
+        ):
+            import cbcrypto
+
+            total_chunks = abs(limit) if limit else 0
+            end_offset = (
+                min(file_size - 1, start_offset + total_chunks * chunk - 1)
+                if total_chunks > 0
+                else file_size - 1
+            )
+            remaining = end_offset - start_offset + 1
+            window_bytes = int(max(2.0, mem_window_mib) * 1024 * 1024)
+            ctl = cbcrypto.StreamCtl(window_bytes, True)
+            ev_box = {"ev": asyncio.Event()}
+
+            def notify() -> None:
+                ev, ev_box["ev"] = ev_box["ev"], asyncio.Event()
+                ev.set()
+
+            task = asyncio.create_task(
+                core_transfer.stream_download(
+                    self,
+                    file_id,
+                    file_size,
+                    None,
+                    start_offset,
+                    ctl,
+                    notify,
+                    end_offset=end_offset,
+                )
+            )
+            fallback_needed = False
+            try:
+                while remaining > 0:
+                    ev = ev_box["ev"]
+                    done = task.done()
+                    parts = ctl.pop_ready(8)
+                    if not parts:
+                        if done:
+                            if task.cancelled():
+                                return
+                            exc = task.exception()
+                            if exc is not None:
+                                raise exc
+                            ok = task.result()
+                            if ok is False and remaining == (end_offset - start_offset + 1):
+                                fallback_needed = True
+                                break
+                            return
+                        try:
+                            await asyncio.wait_for(ev.wait(), timeout=0.5)
+                        except asyncio.TimeoutError:
+                            pass
+                        continue
+
+                    for part in parts:
+                        if len(part) > remaining:
+                            part = part[:remaining]
+                        if part:
+                            remaining -= len(part)
+                            yield part
+                        if remaining <= 0:
+                            break
+            finally:
+                ctl.cancel()
+                if not task.done():
+                    task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+            if not fallback_needed:
+                return
+
+        async for data in self.get_file(file_id, file_size=file_size, limit=limit, offset=offset):
+            yield data
+
     async def get_file(
         self,
         file_id: FileId,
@@ -1697,8 +1789,8 @@ class Client(Methods):
                 if _is_bot:
                     dl_pool_size = int(os.environ.get("CBGRAM_DL_POOL_BOT", 5))
                     dl_workers_per_session = int(os.environ.get("CBGRAM_DL_WORKERS_BOT", 3))
-                    dl_rate = int(os.environ.get("CBGRAM_DL_RATE_BOT", 16))
-                    dl_burst = int(os.environ.get("CBGRAM_DL_BURST_BOT", 8))
+                    dl_rate = int(os.environ.get("CBGRAM_DL_RATE_BOT", 32))
+                    dl_burst = int(os.environ.get("CBGRAM_DL_BURST_BOT", 12))
                 elif _is_premium:
                     dl_pool_size = int(os.environ.get("CBGRAM_DL_POOL_PREMIUM", 6))
                     dl_workers_per_session = int(os.environ.get("CBGRAM_DL_WORKERS_PREMIUM", 4))
@@ -1707,8 +1799,8 @@ class Client(Methods):
                 else:
                     dl_pool_size = int(os.environ.get("CBGRAM_DL_POOL_USER", 5))
                     dl_workers_per_session = int(os.environ.get("CBGRAM_DL_WORKERS_USER", 3))
-                    dl_rate = int(os.environ.get("CBGRAM_DL_RATE_USER", 8))
-                    dl_burst = int(os.environ.get("CBGRAM_DL_BURST_USER", 8))
+                    dl_rate = int(os.environ.get("CBGRAM_DL_RATE_USER", 24))
+                    dl_burst = int(os.environ.get("CBGRAM_DL_BURST_USER", 12))
 
                 total_chunks = math.ceil((file_size - offset_bytes) / chunk_size)
                 pool_size = min(dl_pool_size, total_chunks)
@@ -1735,7 +1827,7 @@ class Client(Methods):
                     ceiling=max(dl_rate, 150),
                     burst=dl_burst,
                     growth=float(os.environ.get("CBGRAM_DL_GROWTH", 1.5)) if _slow_start else 1.0,
-                    slow_start_cap=float(os.environ.get("CBGRAM_DL_SLOWSTART_CAP", 40)),
+                    slow_start_cap=float(os.environ.get("CBGRAM_DL_SLOWSTART_CAP", 60)),
                 )
                 _paced = _is_bot or not _is_premium
 
@@ -1752,6 +1844,7 @@ class Client(Methods):
 
                         try:
                             slept = 0.0
+                            short_retries = 0
 
                             while True:
                                 if _paced:
@@ -1767,7 +1860,6 @@ class Client(Methods):
                                         timeout=Session.MEDIA_WAIT_TIMEOUT,
                                         sleep_threshold=0,
                                     )
-                                    break
                                 except (FloodWait, FloodPremiumWait) as e:
                                     amount = e.value
 
@@ -1781,6 +1873,16 @@ class Client(Methods):
                                         self.name, amount,
                                     )
                                     await asyncio.sleep(amount)
+                                    continue
+
+                                bytes_got = r.bytes
+                                # Retry mid-file short chunks so transient truncation does not cut videos early.
+                                expected_full = file_size <= 0 or (offset + chunk_size <= file_size)
+                                if expected_full and 0 < len(bytes_got) < chunk_size and short_retries < 2:
+                                    short_retries += 1
+                                    await asyncio.sleep(0.1)
+                                    continue
+                                break
                         except BaseException:
                             buffer_slots.release()
                             raise
@@ -1863,15 +1965,23 @@ class Client(Methods):
                     buffer_slots.release_all()
 
                 try:
-                    r = await session.invoke(
-                        raw.functions.upload.GetFile(
-                            location=location,
-                            offset=offset_bytes,
-                            limit=chunk_size
-                        ),
-                        timeout=Session.MEDIA_WAIT_TIMEOUT,
-                        sleep_threshold=30
-                    )
+                    for _first_try in range(3):
+                        r = await session.invoke(
+                            raw.functions.upload.GetFile(
+                                location=location,
+                                offset=offset_bytes,
+                                limit=chunk_size
+                            ),
+                            timeout=Session.MEDIA_WAIT_TIMEOUT,
+                            sleep_threshold=30
+                        )
+                        if not isinstance(r, raw.types.upload.File):
+                            break
+                        expected_first_full = file_size <= 0 or (offset_bytes + chunk_size <= file_size)
+                        if expected_first_full and 0 < len(r.bytes) < chunk_size and _first_try < 2:
+                            await asyncio.sleep(0.1)
+                            continue
+                        break
                 except BaseException:
                     await _drop_prefetch()
                     raise
@@ -1961,6 +2071,9 @@ class Client(Methods):
                                 yield b""
                             else:
                                 while offset_bytes not in received:
+                                    data_ready.clear()
+                                    if offset_bytes in received:
+                                        break
                                     for t in tasks:
                                         if t.done() and not t.cancelled():
                                             exc = t.exception()
@@ -1969,7 +2082,6 @@ class Client(Methods):
                                     if all(t.done() for t in tasks):
                                         return
                                     await data_ready.wait()
-                                    data_ready.clear()
 
                                 chunk = received.pop(offset_bytes)
                                 buffer_slots.release()
