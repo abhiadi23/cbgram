@@ -524,6 +524,9 @@ class Client(Methods):
     DOWNLOAD_POOL_SIZE = 4  # fallback default
     MEDIA_POOL_CAP = 16
     MAX_CONCURRENT_TRANSMISSIONS = 16
+    # Parallel DOWNLOADS are capped lower than uploads: each one opens up to 4 sockets and
+    # Telegram resets everything past ~12 connections in total. 3 x 4 = 12.
+    MAX_CONCURRENT_DOWNLOADS = 3
     MAX_MESSAGE_CACHE_SIZE = 1000
     MAX_TOPIC_CACHE_SIZE = 1000
     MAX_BUSINESS_CONNECTIONS = 512
@@ -686,7 +689,10 @@ class Client(Methods):
         self._media_sessions_locks = {}
 
         self.save_file_semaphore = asyncio.Semaphore(self.max_concurrent_transmissions)
-        self.get_file_semaphore = asyncio.Semaphore(self.max_concurrent_transmissions)
+        self.get_file_semaphore = asyncio.Semaphore(
+            max(1, min(self.max_concurrent_transmissions,
+                       int(os.environ.get("CBGRAM_DL_PARALLEL", self.MAX_CONCURRENT_DOWNLOADS))))
+        )
 
         self._session_creation_gate = asyncio.Semaphore(4)
 
