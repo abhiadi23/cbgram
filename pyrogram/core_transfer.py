@@ -268,9 +268,26 @@ def _adapt_to_distance(pool: int, workers: int, rtt: Optional[float]):
 
 
 def _conn_share() -> int:
-    """Connections this download may open: the global budget split over the downloads running now."""
+    """Connections this download may open: the global budget split over the downloads running now.
+
+    Called BEFORE this download registers itself in ``_dl_state["active"]``, so it counts itself
+    here (+1). The old ``max(3, ...)`` floor let N downloads open 3 x N sockets no matter the
+    budget (16 downloads = 48 connections, which Telegram answers with resets); the floor is now 1
+    and the number of parallel downloads is capped at the client (``get_file_semaphore``), so the
+    budget actually holds.
+    """
     budget = int(os.environ.get("CBGRAM_DL_CONN_BUDGET", DOWNLOAD_CONN_BUDGET))
-    return max(3, budget // max(1, _dl_state["active"]))
+    return max(1, budget // (_dl_state["active"] + 1))
+
+
+def _far_bonus(rtt: Optional[float]) -> int:
+    """Multiplier on the shared budget for far DCs. Default 1 (off): the budget is a hard ceiling,
+    and doubling it is what pushed the total past what Telegram tolerates. Opt in with
+    CBGRAM_DL_FAR_BONUS=2 if a single download on a far DC is too slow."""
+    env = os.environ.get
+    if rtt and rtt > float(env("CBGRAM_DL_FAR_RTT", 0.09)):
+        return max(1, int(env("CBGRAM_DL_FAR_BONUS", 1)))
+    return 1
 
 
 def _band(chunk: int, download: bool = False):
@@ -364,7 +381,7 @@ async def download(client, file_id, file_size: int, file, progress, progress_arg
             rtt = await _measure_rtt(_h, _p)
             pool, workers = _adapt_to_distance(pool, workers, rtt)
             # far servers get double the shared connection budget (they need more sockets for the same speed)
-            pool = min(pool, _conn_share() * (2 if rtt and rtt > float(env("CBGRAM_DL_FAR_RTT", 0.09)) else 1))
+            pool = max(1, min(pool, _conn_share() * _far_bonus(rtt)))
             log.info("Download from DC%s: RTT %s -> %d connections x %d in flight",
                      dc_id, "unknown" if rtt is None else "%.0f ms" % (rtt * 1000), pool, workers)
             chunk = _download_chunk(file_size, pool)
@@ -625,7 +642,7 @@ async def stream_download(client, file_id, file_size: int, path: Optional[str], 
         _, _h, _p = await _endpoint(client, dc_id)
         rtt = await _measure_rtt(_h, _p)
         pool, workers = _adapt_to_distance(pool, workers, rtt)
-        pool = min(pool, _conn_share() * (2 if rtt and rtt > float(env("CBGRAM_DL_FAR_RTT", 0.09)) else 1))
+        pool = max(1, min(pool, _conn_share() * _far_bonus(rtt)))
         start, top = _band(chunk, download=True)
         rate = int(env(f"CBGRAM_DL_RATE_{kind}", round(start)))
         burst = int(env(f"CBGRAM_DL_BURST_{kind}", 8))
