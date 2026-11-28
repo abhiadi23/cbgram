@@ -36,7 +36,7 @@ PART_SIZE = 512 * 1024
 UPLOAD_POOL_MAX = 50
 UPLOAD_WORKERS_DEFAULT = 8
 UPLOAD_POOL_DEFAULT = 18
-DOWNLOAD_WORKERS_DEFAULT = 3   # requests in flight per connection (4 x 4 = 16 MiB in the air; was 15 x 5 = 75, which got connections shed)
+DOWNLOAD_WORKERS_DEFAULT = 2   # requests in flight per connection (4 x 4 = 16 MiB in the air; was 15 x 5 = 75, which got connections shed)
 
 def _flood_log(rpc_name: str):
     """The only log line of a transfer: Telegram asked us to wait, we retry after that many seconds."""
@@ -214,12 +214,12 @@ UPLOAD_SUSTAIN_MIBS = 32.0  # what a bot can send continuously without FloodWait
 TARGET_FLOOR_MIBS = 20.0   # a flood never cuts the rate below this
 BAND_GROWTH = 1.1    # ramp inside the band: +10% per quarter second, so a limit is met gently, not overshot
 UPLOAD_READ_TIMEOUT = 15.0  # a part that is not answered within this is requeued on a fresh connection (was 60 s of frozen speed)
-DL_BURST_MIB = 12.0      # DOWNLOAD fast-start bank, same idea as UPLOAD_BURST_MIB
-DL_SUSTAIN_MIBS = 15.0   # DOWNLOAD steady rate the pacer starts from and then learns up/down (like UPLOAD_SUSTAIN_MIBS)
+DL_BURST_MIB = 0.0      # DOWNLOAD fast-start bank, same idea as UPLOAD_BURST_MIB
+DL_SUSTAIN_MIBS = 18.0   # DOWNLOAD steady rate the pacer starts from and then learns up/down (like UPLOAD_SUSTAIN_MIBS)
 DL_READ_TIMEOUT = 15.0   # a chunk not answered in this long is requeued on a fresh connection (was 60 s of frozen speed)
-DL_TARGET_START_MIBS = 15.0  # DOWNLOAD only: start rate (uploads keep TARGET_START_MIBS)
-DL_TARGET_MAX_MIBS = 30.0    # DOWNLOAD only: ceiling (uploads keep TARGET_MAX_MIBS); pacer backs off on FloodWait
-DL_TARGET_FLOOR_MIBS = 6.0  # DOWNLOAD only: a flood never cuts below this (keeps the average near 20+)
+DL_TARGET_START_MIBS = 18.0  # DOWNLOAD only: start rate (uploads keep TARGET_START_MIBS)
+DL_TARGET_MAX_MIBS = 18.0    # DOWNLOAD only: ceiling (uploads keep TARGET_MAX_MIBS); pacer backs off on FloodWait
+DL_TARGET_FLOOR_MIBS = 10.0  # DOWNLOAD only: a flood never cuts below this (keeps the average near 20+)
 DOWNLOAD_POOL = 4    # parallel connections for ONE download (ferogram caps at 4: more and Telegram sheds them with a reset)
 DOWNLOAD_CONN_BUDGET = 12   # all downloads together (ferogram's global ceiling is 12)
 DOWNLOAD_MAX_RECONNECTS = 25   # consecutive failures per connection (engine default 5 gave up after ~7 s)
@@ -258,7 +258,7 @@ def _adapt_to_distance(pool: int, workers: int, rtt: Optional[float]):
     flight make up for it. Near servers keep the small, safe numbers. Needs no config; CBGRAM_DL_ADAPTIVE=0
     turns it off. A reset still halves everything on the retry, so a too-greedy guess corrects itself."""
     env = os.environ.get
-    if rtt is None or env("CBGRAM_DL_ADAPTIVE", "1") != "1":
+    if rtt is None or env("CBGRAM_DL_ADAPTIVE", "0") != "1":
         return pool, workers
     if rtt > float(env("CBGRAM_DL_VFAR_RTT", 0.20)):
         return max(pool, int(env("CBGRAM_DL_VFAR_POOL", 8))), max(workers, 5)
