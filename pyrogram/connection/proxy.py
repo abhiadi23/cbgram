@@ -422,7 +422,7 @@ def _parse_proxy_link(link: str) -> Proxy:
 
     if web_match:
         query_parameters = parse_qs(web_match.group(1))
-        # `host` is the alias the Android fork emits for the same field.
+        # `host` is an alias some proxy links emit for the same field.
         hostname = _query_param(query_parameters, name="server") or _query_param(
             query_parameters, name="host"
         )
