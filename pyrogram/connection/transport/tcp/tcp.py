@@ -153,6 +153,10 @@ class TCP:
     CONNECT_TIMEOUT = int(os.environ.get("CBGRAM_TCP_CONNECT_TIMEOUT", 600))
 
     SOCKET_BUFFER = int(os.environ.get("CBGRAM_SOCKET_BUFFER", 0))
+    STREAM_READER_LIMIT = int(os.environ.get("CBGRAM_STREAM_READER_LIMIT", 2 * 1024 * 1024))
+    KEEPALIVE_IDLE = int(os.environ.get("CBGRAM_TCP_KEEPIDLE", 15))
+    KEEPALIVE_INTERVAL = int(os.environ.get("CBGRAM_TCP_KEEPINTVL", 5))
+    KEEPALIVE_COUNT = int(os.environ.get("CBGRAM_TCP_KEEPCNT", 3))
 
     MAX_FRAME_SIZE = 0xFFFFFF * 4
 
@@ -252,6 +256,17 @@ class TCP:
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
 
+            # Detect dead/half-open Telegram DC sockets in ~30s instead of the 2-hour OS default.
+            if TCP.KEEPALIVE_IDLE > 0:
+                if hasattr(socket, "TCP_KEEPIDLE"):
+                    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, TCP.KEEPALIVE_IDLE)
+                elif hasattr(socket, "TCP_KEEPALIVE"):
+                    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPALIVE, TCP.KEEPALIVE_IDLE)
+                if hasattr(socket, "TCP_KEEPINTVL") and TCP.KEEPALIVE_INTERVAL > 0:
+                    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, TCP.KEEPALIVE_INTERVAL)
+                if hasattr(socket, "TCP_KEEPCNT") and TCP.KEEPALIVE_COUNT > 0:
+                    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, TCP.KEEPALIVE_COUNT)
+
             if TCP.SOCKET_BUFFER > 0:
                 for option in (socket.SO_SNDBUF, socket.SO_RCVBUF):
                     if TCP.SOCKET_BUFFER > sock.getsockopt(socket.SOL_SOCKET, option):
@@ -267,7 +282,8 @@ class TCP:
         self.reader, self.writer = await asyncio.open_connection(
             host=host,
             port=port,
-            family=family
+            family=family,
+            limit=TCP.STREAM_READER_LIMIT,
         )
 
         self.socket = self.writer.get_extra_info("socket")
@@ -304,7 +320,10 @@ class TCP:
         self.socket = sock
         self._configure_socket(sock)
 
-        self.reader, self.writer = await asyncio.open_connection(sock=sock)
+        self.reader, self.writer = await asyncio.open_connection(
+            sock=sock,
+            limit=TCP.STREAM_READER_LIMIT,
+        )
 
     async def _connect_via_mtproxy(self):
         mtproxy: MTProxy = self.proxy

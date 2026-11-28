@@ -362,7 +362,7 @@ class StreamServer:
                 log.warning("Could not refresh the file reference of %s: %s", src.name, e)
             return False
 
-    async def _download(self, src: _Source, start: int, ctl, notify, path: Optional[str]) -> bool:
+    async def _download(self, src: _Source, start: int, ctl, notify, path: Optional[str], end_offset: Optional[int] = None) -> bool:
         """One stream job, healing an expired file reference (up to twice) by resuming where it stopped."""
         chunk = core_transfer.stream_chunk()
         for attempt in range(3):
@@ -371,7 +371,7 @@ class StreamServer:
             if at >= src.size:
                 return True
             try:
-                return await core_transfer.stream_download(self.client, fid, src.size, path, at, ctl, notify)
+                return await core_transfer.stream_download(self.client, fid, src.size, path, at, ctl, notify, end_offset=end_offset)
             except FileReferenceExpired:
                 if attempt == 2 or not await self._heal(src, fid):
                     raise
@@ -629,12 +629,23 @@ class StreamServer:
 
     # ---- the memory path: Rust engine -> bounded RAM buffer -> socket, no file
 
+    def _effective_mem_window(self) -> int:
+        """Scale per-stream RAM buffer down during rush hour so 20+ streams stay safe in 1 GB RAM."""
+        active = len(self._mem_ctls)
+        if active >= 16:
+            scale = 0.25
+        elif active >= 8:
+            scale = 0.5
+        else:
+            scale = 1.0
+        return int(max(2 * MIB, self.mem_window * scale))
+
     async def _body_memory(self, reader, writer, src: _Source, start: int, end: int, status: int, hdr: dict) -> bool:
         import cbcrypto
 
         chunk = core_transfer.stream_chunk()
         first = (start // chunk) * chunk
-        ctl = cbcrypto.StreamCtl(int(self.mem_window), True)
+        ctl = cbcrypto.StreamCtl(self._effective_mem_window(), True)
         self._mem_ctls.add(ctl)
         box = {"ev": asyncio.Event()}
 
@@ -642,7 +653,7 @@ class StreamServer:
             ev, box["ev"] = box["ev"], asyncio.Event()
             ev.set()
 
-        task = asyncio.create_task(self._download(src, first, ctl, wake, None))
+        task = asyncio.create_task(self._download(src, first, ctl, wake, None, end_offset=end))
         skip = start - first
         remaining = end - start + 1
         headers_sent = False

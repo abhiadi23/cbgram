@@ -180,6 +180,8 @@ class Ticket:
 
 
 class FloodController:
+    _SHARED_COOLDOWNS: Dict[str, Dict[str, float]] = {}
+
     def __init__(
         self,
         *,
@@ -197,6 +199,7 @@ class FloodController:
         max_tracked_peers: int = 4096,
         clock: Callable[[], float] = time.monotonic,
         sleep: Optional[Callable[[float], Any]] = None,
+        shared_group: Optional[str] = None,
     ):
         self.enabled = enabled
         self._concurrency = concurrency
@@ -209,6 +212,7 @@ class FloodController:
         self._clock = clock
         self._sleep = sleep  # None: use asyncio.sleep, looked up at call time (so patching it works)
         self._max_peers = max_tracked_peers
+        self._shared_group = shared_group or os.environ.get("CBGRAM_SHARED_FLOOD") or None
 
         self._methods: Dict[str, _Method] = {}
         self._limits: Dict[str, AdaptiveLimit] = {}
@@ -312,7 +316,7 @@ class FloodController:
 
             # a flood may have started while this call was queued; do not spend the
             # slot on a request that is certain to be refused
-            if m.cooldown_until - self._clock() > 0:
+            if self._cooldown_deadline(m) - self._clock() > 0:
                 limiter.release()
                 continue
 
@@ -322,10 +326,18 @@ class FloodController:
     async def _nap(self, seconds: float):
         await (self._sleep or asyncio.sleep)(seconds)
 
+    def _cooldown_deadline(self, m: _Method) -> float:
+        deadline = m.cooldown_until
+        if self._shared_group:
+            shared = self._SHARED_COOLDOWNS.get(self._shared_group, {}).get(m.name, 0.0)
+            if shared > deadline:
+                deadline = shared
+        return deadline
+
     async def _wait_cooldown(self, m: _Method, sleep_threshold: float, nap=None):
         # bounded: one pass normally, a few if the cooldown keeps being extended by new floods
         for _ in range(64):
-            left = m.cooldown_until - self._clock()
+            left = self._cooldown_deadline(m) - self._clock()
 
             if left <= 0:
                 return
@@ -355,6 +367,9 @@ class FloodController:
         fresh = m.cooldown_until <= now
 
         m.cooldown_until = max(m.cooldown_until, until)
+        if self._shared_group:
+            bucket = self._SHARED_COOLDOWNS.setdefault(self._shared_group, {})
+            bucket[name] = max(bucket.get(name, 0.0), until)
 
         if not fresh:
             return False

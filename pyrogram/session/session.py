@@ -77,6 +77,8 @@ def _serialize_file_part(data: TLObject) -> Optional[bytes]:
 
 
 class Result:
+    __slots__ = ("value", "event")
+
     def __init__(self):
         self.value = None
         self.event = asyncio.Event()
@@ -120,17 +122,18 @@ restart_stagger = RestartStagger()
 class Session:
     START_TIMEOUT = 2
     WAIT_TIMEOUT = 15
-    MEDIA_WAIT_TIMEOUT = int(os.environ.get("CBGRAM_MEDIA_TIMEOUT", 60))
+    MEDIA_WAIT_TIMEOUT = int(os.environ.get("CBGRAM_MEDIA_TIMEOUT", 15))
     SLEEP_THRESHOLD = 10
     MAX_RETRIES = 10
     ACKS_THRESHOLD = 10
     PING_INTERVAL = 5
+    MEDIA_PING_INTERVAL = int(os.environ.get("CBGRAM_MEDIA_PING_INTERVAL", 25))
     STORED_MSG_IDS_MAX_SIZE = 1000 * 2
     MAX_SKEW_AHEAD = 30
     MAX_SKEW_BEHIND = 300
     MAX_SKEW_BREACHES = 3
-    MAX_INFLIGHT_PACKETS = int(os.environ.get("CBGRAM_MAX_INFLIGHT_PACKETS", 16))
-    MAX_INFLIGHT_MEDIA = int(os.environ.get("CBGRAM_MAX_INFLIGHT_MEDIA", 6))
+    MAX_INFLIGHT_PACKETS = int(os.environ.get("CBGRAM_MAX_INFLIGHT_PACKETS", 32))
+    MAX_INFLIGHT_MEDIA = int(os.environ.get("CBGRAM_MAX_INFLIGHT_MEDIA", 8))
     MAX_PENDING_UPDATES = int(os.environ.get("CBGRAM_MAX_PENDING_UPDATES", 256))
     INLINE_CRYPTO_MAX = int(os.environ.get("CBGRAM_INLINE_CRYPTO_MAX", 32 * 1024))
 
@@ -210,6 +213,9 @@ class Session:
 
         self.last_packet_received = 0.0
         self.last_used = time.monotonic()
+        self.last_active_time = self.last_used
+        self.created_at = self.last_used
+        self.usage_count = 0
 
     async def start(self, max_attempts: Optional[int] = None):
         # watches for a blocked event loop (see LoopWatchdog); no-op after the first call
@@ -503,9 +509,8 @@ class Session:
 
         for msg in messages:
             if msg.seq_no % 2 != 0:
-                async with self._handler_lock:
-                    if msg.msg_id not in self.pending_acks:
-                        self.pending_acks.add(msg.msg_id)
+                if msg.msg_id not in self.pending_acks:
+                    self.pending_acks.add(msg.msg_id)
 
             is_bad_notification = isinstance(
                 msg.body, (raw.types.BadMsgNotification, raw.types.BadServerSalt)
@@ -516,59 +521,58 @@ class Session:
 
             rejected = is_bad_notification and msg.body.error_code in (16, 17)
 
-            async with self._handler_lock:
-                if rejected or not self.stored_msg_ids:
-                    MsgId.sync(msg.msg_id, rejected)
+            if rejected or not self.stored_msg_ids:
+                MsgId.sync(msg.msg_id, rejected)
 
-                if len(self.stored_msg_ids) > Session.STORED_MSG_IDS_MAX_SIZE:
-                    cut = Session.STORED_MSG_IDS_MAX_SIZE // 2
-                    self._msg_id_floor = self.stored_msg_ids[cut - 1]
-                    del self.stored_msg_ids[:cut]
+            if len(self.stored_msg_ids) > Session.STORED_MSG_IDS_MAX_SIZE:
+                cut = Session.STORED_MSG_IDS_MAX_SIZE // 2
+                self._msg_id_floor = self.stored_msg_ids[cut - 1]
+                del self.stored_msg_ids[:cut]
 
-                replayed = None
-                skew = None
+            replayed = None
+            skew = None
 
-                if self.stored_msg_ids:
-                    if msg.msg_id <= self._msg_id_floor:
-                        replayed = "The msg_id is below the replay window"
-                    else:
-                        index = bisect.bisect_left(self.stored_msg_ids, msg.msg_id)
+            if self.stored_msg_ids:
+                if msg.msg_id <= self._msg_id_floor:
+                    replayed = "The msg_id is below the replay window"
+                else:
+                    index = bisect.bisect_left(self.stored_msg_ids, msg.msg_id)
 
-                        if index < len(self.stored_msg_ids) and self.stored_msg_ids[index] == msg.msg_id:
-                            replayed = "The msg_id is equal to any of the stored values"
+                    if index < len(self.stored_msg_ids) and self.stored_msg_ids[index] == msg.msg_id:
+                        replayed = "The msg_id is equal to any of the stored values"
 
-                    if replayed is None and not is_bad_notification:
-                        time_diff = (msg.msg_id >> 32) - MsgId.now()
+                if replayed is None and not is_bad_notification:
+                    time_diff = (msg.msg_id >> 32) - MsgId.now()
 
-                        if time_diff > Session.MAX_SKEW_AHEAD or time_diff < -Session.MAX_SKEW_BEHIND:
-                            skew = time_diff
+                    if time_diff > Session.MAX_SKEW_AHEAD or time_diff < -Session.MAX_SKEW_BEHIND:
+                        skew = time_diff
 
-                if replayed is not None:
-                    log.debug("Discarding message: %s", replayed)
-                    continue
+            if replayed is not None:
+                log.debug("Discarding message: %s", replayed)
+                continue
 
-                if skew is not None:
-                    self._skew_breaches += 1
+            if skew is not None:
+                self._skew_breaches += 1
 
-                    log.debug(
-                        "Discarding message %ss out of step (%s/%s)",
-                        int(skew), self._skew_breaches, Session.MAX_SKEW_BREACHES
+                log.debug(
+                    "Discarding message %ss out of step (%s/%s)",
+                    int(skew), self._skew_breaches, Session.MAX_SKEW_BREACHES
+                )
+
+                if self._skew_breaches >= Session.MAX_SKEW_BREACHES:
+                    self._skew_breaches = 0
+                    MsgId.sync(msg.msg_id)
+
+                    log.warning(
+                        "Client clock is %ss out of step with the server; "
+                        "time offset resynchronised to %.1fs",
+                        int(skew), MsgId.time_offset
                     )
 
-                    if self._skew_breaches >= Session.MAX_SKEW_BREACHES:
-                        self._skew_breaches = 0
-                        MsgId.sync(msg.msg_id)
+                continue
 
-                        log.warning(
-                            "Client clock is %ss out of step with the server; "
-                            "time offset resynchronised to %.1fs",
-                            int(skew), MsgId.time_offset
-                        )
-
-                    continue
-
-                self._skew_breaches = 0
-                bisect.insort(self.stored_msg_ids, msg.msg_id)
+            self._skew_breaches = 0
+            bisect.insort(self.stored_msg_ids, msg.msg_id)
 
             if isinstance(msg.body, (raw.types.MsgDetailedInfo, raw.types.MsgNewDetailedInfo)):
                 self.pending_acks.add(msg.body.answer_msg_id)
@@ -594,11 +598,10 @@ class Session:
                 self.results[msg_id].value = getattr(msg.body, "result", msg.body)
                 self.results[msg_id].event.set()
 
-        async with self._handler_lock:
-            ack_ids = None
-            if len(self.pending_acks) >= self.ACKS_THRESHOLD:
-                ack_ids = list(self.pending_acks)
-                self.pending_acks.clear()
+        ack_ids = None
+        if len(self.pending_acks) >= self.ACKS_THRESHOLD:
+            ack_ids = list(self.pending_acks)
+            self.pending_acks.clear()
 
         if ack_ids:
             log.debug("Sending %s acks", len(ack_ids))
@@ -610,10 +613,12 @@ class Session:
 
     async def ping_worker(self):
         log.info("PingTask started")
+        interval = self.MEDIA_PING_INTERVAL if self.is_media else self.PING_INTERVAL
+        disconnect_delay = max(self.WAIT_TIMEOUT + 10, interval + 15)
 
         while True:
             try:
-                await asyncio.wait_for(self.ping_task_event.wait(), self.PING_INTERVAL)
+                await asyncio.wait_for(self.ping_task_event.wait(), interval)
             except asyncio.TimeoutError:
                 pass
             else:
@@ -622,7 +627,7 @@ class Session:
             try:
                 await self.send(
                     raw.functions.PingDelayDisconnect(
-                        ping_id=0, disconnect_delay=self.WAIT_TIMEOUT + 10
+                        ping_id=0, disconnect_delay=disconnect_delay
                     ), False
                 )
 
@@ -639,12 +644,11 @@ class Session:
         that goes quiet below that mark leaves them owed - and the server keeps
         re-delivering the updates they belong to for as long as the client runs.
         """
-        async with self._handler_lock:
-            if not self.pending_acks:
-                return
+        if not self.pending_acks:
+            return
 
-            ack_ids = list(self.pending_acks)
-            self.pending_acks.clear()
+        ack_ids = list(self.pending_acks)
+        self.pending_acks.clear()
 
         log.debug("Sending %s acks", len(ack_ids))
 
@@ -929,12 +933,13 @@ class Session:
                 )
 
                 if isinstance(e, ConnectionResetError):
-                    await asyncio.sleep(0.1)
+                    await asyncio.sleep(0.05 if self.is_media else 0.1)
                 elif isinstance(e, (InternalServerError, ServiceUnavailable)) or (
                     isinstance(e, TimeoutError)
                     and time.monotonic() - self.last_packet_received < self.WAIT_TIMEOUT
                 ):
-                    await asyncio.sleep(min(2 ** (attempt - 1), 30))
+                    delay = min(0.15 * attempt, 1.0) if (self.is_media and isinstance(e, TimeoutError)) else min(2 ** (attempt - 1), 30)
+                    await asyncio.sleep(delay)
                 else:
                     await self.restart()
 
