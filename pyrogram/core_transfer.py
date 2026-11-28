@@ -217,7 +217,7 @@ UPLOAD_READ_TIMEOUT = 15.0  # a part that is not answered within this is requeue
 DL_BURST_MIB = 0.0      # DOWNLOAD fast-start bank, same idea as UPLOAD_BURST_MIB
 DL_SUSTAIN_MIBS = 18.0   # DOWNLOAD steady rate the pacer starts from and then learns up/down (like UPLOAD_SUSTAIN_MIBS)
 DL_READ_TIMEOUT = 15.0   # a chunk not answered in this long is requeued on a fresh connection (was 60 s of frozen speed)
-DL_TARGET_START_MIBS = 18.0  # DOWNLOAD only: start rate (uploads keep TARGET_START_MIBS)
+DL_TARGET_START_MIBS = 10.0  # DOWNLOAD only: start rate (uploads keep TARGET_START_MIBS)
 DL_TARGET_MAX_MIBS = 18.0    # DOWNLOAD only: ceiling (uploads keep TARGET_MAX_MIBS); pacer backs off on FloodWait
 DL_TARGET_FLOOR_MIBS = 10.0  # DOWNLOAD only: a flood never cuts below this (keeps the average near 20+)
 DOWNLOAD_POOL = 4    # parallel connections for ONE download (ferogram caps at 4: more and Telegram sheds them with a reset)
@@ -365,6 +365,7 @@ async def download(client, file_id, file_size: int, file, progress, progress_arg
         dc_id = file_id.dc_id
         is_bot, is_premium = _flags(client)
         env = os.environ.get
+        rtt = None  # only measured on the non-premium path
 
         if is_premium and not is_bot:
             pool, workers = int(env("CBGRAM_DL_POOL_PREMIUM", 6)), int(env("CBGRAM_DL_WORKERS_PREMIUM", 4))
@@ -387,7 +388,7 @@ async def download(client, file_id, file_size: int, file, progress, progress_arg
             chunk = _download_chunk(file_size, pool)
             start, top = _band(chunk, download=True)
             rate = int(env(f"CBGRAM_DL_RATE_{kind}", round(start)))
-            burst = int(env(f"CBGRAM_DL_BURST_{kind}", 8))
+            burst = int(env(f"CBGRAM_DL_BURST_{kind}", 2))
             cap = float(env("CBGRAM_DL_SLOWSTART_CAP", top))
             ceiling = float(max(rate, cap))
             floor = _floor(chunk, download=True)
@@ -414,6 +415,13 @@ async def download(client, file_id, file_size: int, file, progress, progress_arg
                 a_sustain = max(floor, sustain / gentle) if sustain else 0.0
                 tracker = _Progress(client, progress, progress_args, file_size)
                 tracker.base = resume_at
+                stats: dict = {}
+                t_start = time.perf_counter()
+                log.warning("[cbgram] download start: %.0f MiB, chunk %d KiB, %d conn x %d in flight, rate %.0f->%.0f req/s "
+                            "(floor %.0f), burst %s, credit %.0f, rtt %s, attempt %d",
+                            file_size / 1048576, chunk // 1024, a_pool, workers, a_rate, a_ceiling, floor,
+                            max(burst, round(a_rate * 0.15)), a_credit,
+                            f"{rtt * 1000:.0f}ms" if rtt else "n/a", attempt + 1)
 
                 call = functools.partial(
                     cbcrypto.download,
@@ -444,6 +452,7 @@ async def download(client, file_id, file_size: int, file, progress, progress_arg
                     **({"max_reconnects": max_reconnects} if _accepts(cbcrypto.download, "max_reconnects") else {}),
                     **({"floor": floor} if _accepts(cbcrypto.download, "floor") else {}),
                     **({"on_flood": _flood_log("upload.GetFile")} if _accepts(cbcrypto.download, "on_flood") else {}),
+                    **({"stats": stats} if _accepts(cbcrypto.download, "stats") else {}),
                 )
 
                 try:
@@ -466,6 +475,13 @@ async def download(client, file_id, file_size: int, file, progress, progress_arg
                         return True
                     continue
                 await tracker.finish()
+                took = max(time.perf_counter() - t_start, 1e-3)
+                log.warning("[cbgram] download done: %.1f MiB in %.1fs = %.1f MiB/s | floods %s (%.0fs waited, max %.0fs), "
+                            "reconnects %s, timeouts %s, pace_end %s req/s",
+                            (file_size - resume_at) / 1048576, took, (file_size - resume_at) / 1048576 / took,
+                            stats.get("floods", "?"), stats.get("flood_seconds", 0), stats.get("flood_max_seconds", 0),
+                            stats.get("reconnects", "?"), stats.get("timeouts", "?"),
+                            round(stats["pace_end"]) if "pace_end" in stats else "?")
                 return True
         finally:
             _dl_state["active"] -= 1
@@ -645,7 +661,7 @@ async def stream_download(client, file_id, file_size: int, path: Optional[str], 
         pool = max(1, min(pool, _conn_share() * _far_bonus(rtt)))
         start, top = _band(chunk, download=True)
         rate = int(env(f"CBGRAM_DL_RATE_{kind}", round(start)))
-        burst = int(env(f"CBGRAM_DL_BURST_{kind}", 8))
+        burst = int(env(f"CBGRAM_DL_BURST_{kind}", 2))
         cap = float(env("CBGRAM_DL_SLOWSTART_CAP", top))
         ceiling = float(max(rate, cap))
         floor = _floor(chunk, download=True)
